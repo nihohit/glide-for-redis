@@ -1,7 +1,11 @@
 import percentile from "percentile";
 import { stdev } from "stats-lite";
 import { createClient } from "redis";
-import { AsyncClient, SocketConnection } from "babushka-rs";
+import {
+    AsyncClient,
+    SocketConnection,
+    SocketLikeConnection,
+} from "babushka-rs";
 import commandLineArgs from "command-line-args";
 import { writeFileSync } from "fs";
 
@@ -178,6 +182,7 @@ async function run_client(
         ...get_non_existing_latency_results,
     };
     bench_json_results.push(json_res);
+    console.log(`Done ${client_name} ${num_of_concurrent_tasks} ${data_size}`);
 }
 
 async function main(
@@ -221,6 +226,19 @@ async function main(
             data
         );
         babushka_socket_client.dispose();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        const babushka_socket_like_client =
+            await SocketLikeConnection.CreateConnection(address);
+        await run_client(
+            babushka_socket_like_client,
+            "babushka socketlike",
+            total_commands,
+            num_of_concurrent_tasks,
+            data_size,
+            data
+        );
+        babushka_socket_like_client.dispose();
         await new Promise((resolve) => setTimeout(resolve, 100));
     }
 

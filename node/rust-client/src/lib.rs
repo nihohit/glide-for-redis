@@ -1,5 +1,5 @@
 use babushka::headers::HEADER_END;
-use babushka::start_socket_listener;
+use babushka::{start_listener, start_socket_listener, ReadSender, WriteSender};
 use napi::bindgen_prelude::ToNapiValue;
 use napi::{Env, Error, JsObject, Result, Status};
 use napi_derive::napi;
@@ -43,11 +43,11 @@ struct AsyncClient {
     runtime: Runtime,
 }
 
-fn to_js_error(err: RedisError) -> Error {
-    napi::Error::new(Status::Unknown, err.to_string())
+fn to_js_error<E: std::error::Error>(err: E) -> Error {
+    Error::new(Status::Unknown, err.to_string())
 }
 
-fn to_js_result<T>(result: RedisResult<T>) -> Result<T> {
+fn to_js_result<T, E: std::error::Error>(result: std::result::Result<T, E>) -> Result<T> {
     result.map_err(to_js_error)
 }
 
@@ -113,6 +113,81 @@ pub fn start_socket_listener_external(env: Env) -> Result<JsObject> {
         match result {
             Ok(path) => deferred.resolve(|_| Ok(path)),
             Err(e) => deferred.reject(to_js_error(e)),
+        };
+    });
+
+    Ok(promise)
+}
+
+#[napi]
+struct SocketLikeClient {
+    #[allow(dead_code)]
+    write_sender: Option<WriteSender>,
+    read_sender: Option<ReadSender>,
+}
+
+#[napi]
+impl SocketLikeClient {
+    fn new(write_sender: WriteSender, read_sender: ReadSender) -> SocketLikeClient {
+        SocketLikeClient {
+            write_sender: Some(write_sender),
+            read_sender: Some(read_sender),
+        }
+    }
+
+    #[napi(ts_return_type = "Promise<number>")]
+    #[allow(dead_code)]
+    pub fn write(&self, env: Env, buffer: Uint8Array) -> Result<JsObject> {
+        let (deferred, promise) = env.create_deferred()?;
+        let request = SocketWriteRequest::new(
+            Box::new(buffer),
+            Box::new(move |size| {
+                deferred.resolve(move |_| Ok(size as u32));
+            }),
+        );
+        let _ = self.write_sender.as_ref().unwrap().send(request);
+
+        Ok(promise)
+    }
+
+    #[napi(ts_return_type = "Promise<[number, number]>")]
+    #[allow(dead_code)]
+    pub fn read(&self, env: Env, buffer: Uint8Array) -> Result<JsObject> {
+        let (deferred, promise) = env.create_deferred()?;
+        let request = SocketReadRequest::new(
+            Box::new(buffer),
+            Box::new(move |(size, remaining)| {
+                let arr = [size as u32, remaining as u32];
+                deferred.resolve(move |_| Ok(arr));
+            }),
+        );
+        let _ = self.read_sender.as_ref().unwrap().send(request);
+
+        Ok(promise)
+    }
+
+    #[napi]
+    #[allow(dead_code)]
+    pub fn close(&mut self) {
+        println!("closing");
+        self.read_sender = None;
+        self.write_sender = None;
+    }
+}
+
+#[napi(
+    js_name = "StartSocketLikeConnection",
+    ts_return_type = "Promise<SocketLikeClient>"
+)]
+pub fn start_socket_like_listener_external(env: Env) -> Result<JsObject> {
+    let (deferred, promise) = env.create_deferred()?;
+
+    start_listener(move |result| {
+        match result {
+            Ok((read_sender, write_sender)) => {
+                deferred.resolve(|_| Ok(SocketLikeClient::new(read_sender, write_sender)))
+            }
+            Err(err) => deferred.reject(to_js_error(err)),
         };
     });
 

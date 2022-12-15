@@ -23,8 +23,14 @@ export const enum ResponseType {
 }
 export const HEADER_LENGTH_IN_BYTES: number
 export function StartSocketConnection(): Promise<string>
+export function StartSocketLikeConnection(): Promise<SocketLikeClient>
 export class AsyncClient {
   static CreateConnection(connectionAddress: string): AsyncClient
   get(key: string): Promise<string | null>
   set(key: string, value: string): Promise<void>
+}
+export class SocketLikeClient {
+  write(buffer: Uint8Array): Promise<number>
+  read(buffer: Uint8Array): Promise<[number, number]>
+  close(): void
 }
