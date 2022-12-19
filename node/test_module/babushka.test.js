@@ -250,8 +250,8 @@ describe("socket client", () => {
     });
 });
 
-xdescribe("socket memory client", () => {
-    it("set and get flow works", async () => {
+describe("socket memory client", () => {
+    xit("set and get flow works", async () => {
         const port = await FreePort(3000).then(([free_port]) => free_port);
         await OpenServerAndExecute(port, async () => {
             const client = await SocketLikeConnection.CreateConnection(
@@ -263,7 +263,7 @@ xdescribe("socket memory client", () => {
         });
     });
 
-    it("can handle non-ASCII unicode", async () => {
+    xit("can handle non-ASCII unicode", async () => {
         const port = await FreePort(3000).then(([free_port]) => free_port);
         await OpenServerAndExecute(port, async () => {
             const client = await SocketLikeConnection.CreateConnection(
@@ -280,7 +280,7 @@ xdescribe("socket memory client", () => {
         });
     });
 
-    it("get for missing key returns null", async () => {
+    xit("get for missing key returns null", async () => {
         const port = await FreePort(3000).then(([free_port]) => free_port);
         await OpenServerAndExecute(port, async () => {
             const client = await SocketLikeConnection.CreateConnection(
@@ -295,7 +295,7 @@ xdescribe("socket memory client", () => {
         });
     });
 
-    it("get for empty string", async () => {
+    xit("get for empty string", async () => {
         const port = await FreePort(3000).then(([free_port]) => free_port);
         await OpenServerAndExecute(port, async () => {
             const client = await SocketLikeConnection.CreateConnection(
@@ -312,7 +312,7 @@ xdescribe("socket memory client", () => {
         });
     });
 
-    it("send very large values", async () => {
+    xit("send very large values", async () => {
         const port = await FreePort(3000).then(([free_port]) => free_port);
         await OpenServerAndExecute(port, async () => {
             const client = await SocketLikeConnection.CreateConnection(
@@ -337,7 +337,7 @@ xdescribe("socket memory client", () => {
         });
     });
 
-    xit("can handle concurrent operations", async () => {
+    it("can handle concurrent operations", async () => {
         const port = await FreePort(3000).then(([free_port]) => free_port);
         await OpenServerAndExecute(port, async () => {
             const client = await SocketLikeConnection.CreateConnection(

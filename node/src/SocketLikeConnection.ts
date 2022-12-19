@@ -94,6 +94,18 @@ export class SocketLikeConnection {
             }
             const callbackIndex = header.getUint32(4, true);
             const responseType = header.getUint32(8, true) as ResponseType;
+            if (callbackIndex === undefined) {
+                throw new Error("Callback is undefined");
+            }
+            if (this === undefined) {
+                throw new Error("this is undefined");
+            }
+            if (this.promiseCallbackFunctions === undefined) {
+                throw new Error("promiseCallbackFunctions is undefined");
+            }
+            if (this.promiseCallbackFunctions[callbackIndex] === undefined) {
+                throw new Error("no results for " + callbackIndex);
+            }
             const [resolve, reject] =
                 this.promiseCallbackFunctions[callbackIndex];
             this.availableCallbackSlots.push(callbackIndex);

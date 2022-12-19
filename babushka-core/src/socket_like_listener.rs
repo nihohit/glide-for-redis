@@ -490,6 +490,22 @@ impl SocketReadRequest {
     }
 }
 
+impl std::fmt::Debug for SocketWriteRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SocketWriteRequest")
+            .field("buffer", &self.buffer.as_ptr_range())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for SocketReadRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SocketReadRequest")
+            .field("buffer", &self.buffer.as_ptr_range())
+            .finish()
+    }
+}
+
 /// Creates a new thread with a main loop task listening on the socket for new connections.
 /// Every new connection will be assigned with a client-listener task to handle their requests.
 ///
