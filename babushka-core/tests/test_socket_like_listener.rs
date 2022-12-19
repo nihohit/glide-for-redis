@@ -5,29 +5,48 @@ use crate::support::*;
 #[cfg(test)]
 mod socket_like_listener {
     use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-    use ntest::timeout;
-    use num_traits::{FromPrimitive, ToPrimitive};
+    use num_traits::ToPrimitive;
     use rand::{distributions::Standard, thread_rng, Rng};
     use redis::socket_listener::headers::{
         RequestType, ResponseType, CALLBACK_INDEX_END, HEADER_END, MESSAGE_LENGTH_END,
-        MESSAGE_LENGTH_FIELD_LENGTH, TYPE_END,
     };
     use redis::socket_listener::{
         start_listener, ReadSender, SocketReadRequest, SocketWriteRequest, WriteSender,
     };
     use rsevents::{Awaitable, EventState, ManualResetEvent};
-    use std::cell::RefCell;
+    use std::cell::{RefCell, RefMut};
     use std::io::prelude::*;
-    use std::sync::{Arc, Mutex};
-    use std::thread;
+    use std::ops::{Deref, DerefMut};
+    use std::sync::Arc;
     use tokio::sync::oneshot;
 
     use super::*;
+
+    struct VecWrapper<'a> {
+        vec: Arc<RefMut<'a, Vec<u8>>>,
+    }
+
+    impl Deref for VecWrapper<'_> {
+        type Target = [u8];
+
+        fn deref(&self) -> &Self::Target {
+            (*self.vec).as_slice()
+        }
+    }
+
+    impl DerefMut for VecWrapper<'_> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            (*self.vec).as_mut_slice()
+        }
+    }
 
     struct SocketLikeClient {
         write_sender: WriteSender,
         read_sender: ReadSender,
     }
+
+    ///TODO - NNNOOOOOOOOO
+    unsafe impl Send for SocketLikeClient {}
 
     struct TestBasics {
         _server: RedisServer,
@@ -39,58 +58,75 @@ mod socket_like_listener {
         const CALLBACK_INDEX: u32 = 1;
         let address = format!("redis://{}", address);
         let message_length = address.len() + HEADER_END;
-        let mut buffer_wrapper = Arc::new(RefCell::new(Vec::with_capacity(message_length)));
-        let buffer = buffer_wrapper.get_mut();
-        buffer
-            .write_u32::<LittleEndian>(message_length as u32)
-            .unwrap();
-        buffer
-            .write_u32::<LittleEndian>(CALLBACK_INDEX as u32)
-            .unwrap();
-        buffer
-            .write_u32::<LittleEndian>(RequestType::ServerAddress.to_u32().unwrap())
-            .unwrap();
-        buffer.write_all(address.as_bytes()).unwrap();
+        let mut buffer_wrapper = RefCell::new(Vec::new());
+        let mut buffer_ref_wrapper = Arc::new(buffer_wrapper.borrow_mut());
+        {
+            let buffer = (*buffer_ref_wrapper);
+            buffer
+                .write_u32::<LittleEndian>(message_length as u32)
+                .unwrap();
+            buffer
+                .write_u32::<LittleEndian>(CALLBACK_INDEX as u32)
+                .unwrap();
+            buffer
+                .write_u32::<LittleEndian>(RequestType::ServerAddress.to_u32().unwrap())
+                .unwrap();
+            buffer.write_all(address.as_bytes()).unwrap();
+        }
         let (sender, receiver) = oneshot::channel();
+
         socket
             .write_sender
             .send(SocketWriteRequest {
-                buffer: Box::new(buffer_wrapper.clone()),
+                buffer: Box::new(VecWrapper {
+                    vec: buffer_ref_wrapper.clone(),
+                }),
                 completion: Box::new(move |bytes| {
                     sender.send(bytes);
                 }),
             })
             .unwrap();
+
         let read_bytes = receiver.blocking_recv().unwrap();
-        assert_eq!(read_bytes, buffer.len());
-        buffer.clear();
+        {
+            let buffer = buffer_ref_wrapper.get_mut();
+            assert_eq!(read_bytes, buffer.len());
+            buffer.clear();
+        }
+
         let (sender, receiver) = oneshot::channel();
         socket.read_sender.send(SocketReadRequest {
-            buffer: Box::new(buffer.clone()),
+            buffer: Box::new(VecWrapper {
+                vec: buffer_ref_wrapper.clone(),
+            }),
             completion: Box::new(move |bytes| {
                 sender.send(bytes);
             }),
         });
+
         let (size, _) = receiver.blocking_recv().unwrap();
-        assert_eq!(size, HEADER_END);
-        assert_eq!(
-            (&buffer[..MESSAGE_LENGTH_END])
-                .read_u32::<LittleEndian>()
-                .unwrap(),
-            HEADER_END as u32
-        );
-        assert_eq!(
-            (&buffer[MESSAGE_LENGTH_END..CALLBACK_INDEX_END])
-                .read_u32::<LittleEndian>()
-                .unwrap(),
-            CALLBACK_INDEX
-        );
-        assert_eq!(
-            (&buffer[CALLBACK_INDEX_END..HEADER_END])
-                .read_u32::<LittleEndian>()
-                .unwrap(),
-            ResponseType::Null.to_u32().unwrap()
-        );
+        {
+            let buffer = buffer_ref_wrapper.get_mut();
+            assert_eq!(size, HEADER_END);
+            assert_eq!(
+                (&buffer[..MESSAGE_LENGTH_END])
+                    .read_u32::<LittleEndian>()
+                    .unwrap(),
+                HEADER_END as u32
+            );
+            assert_eq!(
+                (&buffer[MESSAGE_LENGTH_END..CALLBACK_INDEX_END])
+                    .read_u32::<LittleEndian>()
+                    .unwrap(),
+                CALLBACK_INDEX
+            );
+            assert_eq!(
+                (&buffer[CALLBACK_INDEX_END..HEADER_END])
+                    .read_u32::<LittleEndian>()
+                    .unwrap(),
+                ResponseType::Null.to_u32().unwrap()
+            );
+        }
     }
 
     fn setup_test_basics() -> TestBasics {
@@ -107,8 +143,8 @@ mod socket_like_listener {
                 write_sender,
                 read_sender,
             };
-            let mut path_arc_clone = socket_arc_clone.lock().unwrap();
-            *path_arc_clone = Some(socket);
+            let mut socket_arc_clone = socket_arc_clone.lock().unwrap();
+            *socket_arc_clone = Some(socket);
             cloned_state.set();
         });
         socket_listener_state.wait();
