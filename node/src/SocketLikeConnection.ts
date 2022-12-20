@@ -73,13 +73,17 @@ export class SocketLikeConnection {
             return;
         }
         const dataArray = this.getAvailableReadArray();
+        // console.log(`JS Reading from ${dataArray.byteOffset}`);
         const [bytesRead, bytesRemaining] = await this.socket.read(dataArray);
         const bytesToParse = (this.remainingReadData?.length ?? 0) + bytesRead;
-
+        // console.log(
+        //     `JS Read ${bytesRead} bytes, parsing up to ${bytesToParse}`
+        // );
         let counter = 0;
         while (counter <= bytesToParse - HEADER_LENGTH_IN_BYTES) {
             const header = new DataView(this.backingReadBuffer, counter, 12);
             const length = header.getUint32(0, true);
+            // console.log(`JS length: ${length}`);
             if (length === 0) {
                 throw new Error("length 0");
             }
@@ -87,9 +91,12 @@ export class SocketLikeConnection {
                 this.remainingReadData = new Uint8Array(
                     dataArray.buffer,
                     counter,
-                    dataArray.byteLength - counter
+                    bytesToParse - counter
                 );
                 this.increaseReadBufferSize(Math.max(bytesRemaining, length));
+                // console.log(
+                //     `Leaving with unread ${this.remainingReadData.byteLength} bytes`
+                // );
                 return;
             }
             const callbackIndex = header.getUint32(4, true);
@@ -104,7 +111,9 @@ export class SocketLikeConnection {
                 throw new Error("promiseCallbackFunctions is undefined");
             }
             if (this.promiseCallbackFunctions[callbackIndex] === undefined) {
-                throw new Error("no results for " + callbackIndex);
+                throw new Error(
+                    `JS no results for ${callbackIndex} when parsing from ${counter}`
+                );
             }
             const [resolve, reject] =
                 this.promiseCallbackFunctions[callbackIndex];

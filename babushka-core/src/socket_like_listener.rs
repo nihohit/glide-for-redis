@@ -75,6 +75,8 @@ fn write_response_header(
     length: usize,
 ) -> Result<(), io::Error> {
     let mut vec = accumulated_outputs.take();
+    let last_len = vec.len();
+    // println!("RS write length {}", length);
     vec.put_u32_le(length as u32);
     vec.put_u32_le(callback_index);
     vec.put_u32_le(response_type.to_u32().ok_or_else(|| {
@@ -103,7 +105,10 @@ fn write_null_response_header(
 
 fn write_slice_to_output(accumulated_outputs: &Cell<Vec<u8>>, bytes_to_write: &[u8]) {
     let mut vec = accumulated_outputs.take();
+    let last_len = vec.len();
     vec.extend_from_slice(bytes_to_write);
+    let next_len = vec.len();
+    // println!("RS Writing from {} to {}", last_len, next_len);
     accumulated_outputs.set(vec);
 }
 
@@ -342,7 +347,7 @@ async fn read_values(
     loop {
         match client_listener.next_values().await {
             Closed(reason) => {
-                println!("done read_values");
+                // println!("RS done read_values");
                 return Err(BabushkaError::CloseError(reason)); // TODO: implement error protocol, handle error closing reasons
             }
             ReceivedValues(received_requests) => {
@@ -365,13 +370,13 @@ async fn write_accumulated_outputs(
 ) -> Result<(), BabushkaError> {
     loop {
         let Some(mut write_request) = write_request_receiver.recv().await else {
-            println!("done write_accumulated_outputs");
+            // println!("RS done write_accumulated_outputs");
             return Err(BabushkaError::CloseError(ClosingReason2::AllConnectionsClosed));
         };
         read_possible.notified().await;
         let mut vec = accumulated_outputs.take();
         assert!(!vec.is_empty());
-
+        let last_len = vec.len();
         let mut reference = write_request.buffer.as_mut().as_mut();
 
         let bytes_to_write = min(reference.len(), vec.len());
@@ -380,6 +385,11 @@ async fn write_accumulated_outputs(
             read_possible.notify_one();
         }
         let remaining_vec_len = vec.len();
+        // println!(
+        //     "RS Written to socket {} bytes in range {:?}",
+        //     bytes_to_write,
+        //     reference.as_ptr_range()
+        // );
         accumulated_outputs.set(vec);
 
         let completion = write_request.completion;
@@ -412,7 +422,7 @@ async fn listen_on_client_stream(
         write_accumulated_outputs(&mut read_request_receiver, &accumulated_outputs, &notifier)
     )
     .map(|_| ());
-    println!("done listen_on_client_stream");
+    // println!("RS done listen_on_client_stream");
     return result;
 }
 
@@ -430,7 +440,7 @@ where
             read_request_receiver,
         ))
         .await;
-    println!("done listen_on_socket");
+    println!("RS done listen_on_socket");
 }
 
 #[derive(Debug)]
@@ -515,7 +525,7 @@ pub fn start_listener<InitCallback>(init_callback: InitCallback)
 where
     InitCallback: FnOnce(Result<(WriteSender, ReadSender), RedisError>) + Send + 'static,
 {
-    println!("start start_listener");
+    println!("RS start start_listener");
     thread::Builder::new()
         .name("socket_like_listener_thread".to_string())
         .spawn(move || {
@@ -529,7 +539,7 @@ where
                 }
                 Err(err) => init_callback(Err(err.into())),
             };
-            println!("done thread");
+            println!("RS done thread");
         })
         .expect("Thread spawn failed. Cannot report error because callback was moved.");
 }
