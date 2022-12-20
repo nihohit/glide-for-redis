@@ -58,10 +58,10 @@ mod socket_like_listener {
         const CALLBACK_INDEX: u32 = 1;
         let address = format!("redis://{}", address);
         let message_length = address.len() + HEADER_END;
-        let mut buffer_wrapper = RefCell::new(Vec::new());
-        let mut buffer_ref_wrapper = Arc::new(buffer_wrapper.borrow_mut());
+        let buffer_wrapper = RefCell::new(Vec::new());
+        let buffer_ref_wrapper = Arc::new(buffer_wrapper.borrow_mut());
         {
-            let buffer = (*buffer_ref_wrapper);
+            let buffer = *buffer_ref_wrapper;
             buffer
                 .write_u32::<LittleEndian>(message_length as u32)
                 .unwrap();
@@ -89,7 +89,7 @@ mod socket_like_listener {
 
         let read_bytes = receiver.blocking_recv().unwrap();
         {
-            let buffer = buffer_ref_wrapper.get_mut();
+            let buffer = *buffer_ref_wrapper;
             assert_eq!(read_bytes, buffer.len());
             buffer.clear();
         }
@@ -106,7 +106,7 @@ mod socket_like_listener {
 
         let (size, _) = receiver.blocking_recv().unwrap();
         {
-            let buffer = buffer_ref_wrapper.get_mut();
+            let buffer = *buffer_ref_wrapper;
             assert_eq!(size, HEADER_END);
             assert_eq!(
                 (&buffer[..MESSAGE_LENGTH_END])
