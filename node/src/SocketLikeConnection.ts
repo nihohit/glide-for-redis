@@ -24,27 +24,28 @@ export class SocketLikeConnection {
     ][] = [];
     private readonly availableCallbackSlots: number[] = [];
     private readonly encoder = new TextEncoder();
-    private backingReadBuffer = new ArrayBuffer(512);
-    private backingWriteBuffer = new ArrayBuffer(512);
+    private backingReadBuffer = new ArrayBuffer(1024);
+    private backingWriteBuffer = new ArrayBuffer(1024);
     private bufferedWriteRequests: WriteRequest[] = [];
     private writeInProgress = false;
     private remainingReadData: Uint8Array | undefined;
 
     private moveRemainingReadData(buffer: ArrayBuffer) {
-        const array = new Uint8Array(buffer, 0, buffer.byteLength);
-        if (this.remainingReadData) {
-            array.set(this.remainingReadData);
-            this.remainingReadData = new Uint8Array(
-                buffer,
-                0,
-                this.remainingReadData.length
-            );
+        if (!this.remainingReadData) {
+            return;
         }
+        const array = new Uint8Array(buffer, 0, buffer.byteLength);
+        array.set(this.remainingReadData);
+        this.remainingReadData = new Uint8Array(
+            buffer,
+            0,
+            this.remainingReadData.length
+        );
     }
 
-    private increaseReadBufferSize(requiredLength?: number) {
+    private increaseReadBufferSize(requiredAdditionalLength: number) {
         const newBuffer = new ArrayBuffer(
-            this.backingReadBuffer.byteLength + (requiredLength ?? 1024)
+            this.backingReadBuffer.byteLength + requiredAdditionalLength
         );
         this.moveRemainingReadData(newBuffer);
 
@@ -56,7 +57,7 @@ export class SocketLikeConnection {
         const availableBufferSpace =
             this.backingReadBuffer.byteLength - readDataLength;
         if (availableBufferSpace < HEADER_LENGTH_IN_BYTES) {
-            this.increaseReadBufferSize();
+            this.increaseReadBufferSize(1024);
         } else if (this.remainingReadData?.byteOffset ?? 0 > 0) {
             this.moveRemainingReadData(this.backingReadBuffer);
         }
@@ -73,17 +74,12 @@ export class SocketLikeConnection {
             return;
         }
         const dataArray = this.getAvailableReadArray();
-        // console.log(`JS Reading from ${dataArray.byteOffset}`);
         const [bytesRead, bytesRemaining] = await this.socket.read(dataArray);
         const bytesToParse = (this.remainingReadData?.length ?? 0) + bytesRead;
-        // console.log(
-        //     `JS Read ${bytesRead} bytes, parsing up to ${bytesToParse}`
-        // );
         let counter = 0;
         while (counter <= bytesToParse - HEADER_LENGTH_IN_BYTES) {
             const header = new DataView(this.backingReadBuffer, counter, 12);
             const length = header.getUint32(0, true);
-            // console.log(`JS length: ${length}`);
             if (length === 0) {
                 throw new Error("length 0");
             }
@@ -94,9 +90,6 @@ export class SocketLikeConnection {
                     bytesToParse - counter
                 );
                 this.increaseReadBufferSize(Math.max(bytesRemaining, length));
-                // console.log(
-                //     `Leaving with unread ${this.remainingReadData.byteLength} bytes`
-                // );
                 return;
             }
             const callbackIndex = header.getUint32(4, true);
