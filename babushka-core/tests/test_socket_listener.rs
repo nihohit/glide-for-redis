@@ -16,6 +16,10 @@ use utilities::*;
 
 #[cfg(test)]
 mod socket_listener {
+    use std::rc::Rc;
+
+    use tokio::{runtime::Builder, sync::Notify, task};
+
     use super::*;
 
     struct TestBasics {
@@ -100,6 +104,30 @@ mod socket_listener {
             Ok(env) => env.eq_ignore_ascii_case("tcp+tls") || env.eq_ignore_ascii_case("unix"),
             Err(_) => false,
         }
+    }
+
+    async fn notify(notifier: Rc<Notify>) {
+        notifier.notify_one();
+        notifier.notify_one();
+    }
+
+    async fn wait_for_notify(notifier: Rc<Notify>) {
+        notifier.notified().await;
+        notifier.notified().await;
+    }
+
+    async fn do_test() {
+        let notifier = Rc::new(Notify::new());
+        tokio::join!(wait_for_notify(notifier.clone()), notify(notifier.clone()));
+    }
+
+    #[test]
+    fn test_notify() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+
+        runtime.block_on(async {
+            do_test().await;
+        });
     }
 
     #[test]

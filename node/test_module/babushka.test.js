@@ -353,10 +353,16 @@ describe("socket memory client", () => {
                 }
             };
 
+            const multiOp = async (index) => {
+                for (let i = 0; i < 100; ++i) {
+                    await singleOp(index + i);
+                }
+            };
+
             const operations = [];
 
             for (let i = 0; i < 100; ++i) {
-                operations.push(singleOp(i));
+                operations.push(multiOp(i));
             }
 
             await Promise.all(operations);
