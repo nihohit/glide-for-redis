@@ -75,8 +75,6 @@ fn write_response_header(
     length: usize,
 ) -> Result<(), io::Error> {
     let mut vec = accumulated_outputs.borrow_mut();
-    // let last_len = vec.len();
-    // println!("RS write length {}", length);
     vec.put_u32_le(length as u32);
     vec.put_u32_le(callback_index);
     vec.put_u32_le(response_type.to_u32().ok_or_else(|| {
@@ -104,11 +102,7 @@ fn write_null_response_header(
 
 fn write_slice_to_output(accumulated_outputs: &RefCell<Vec<u8>>, bytes_to_write: &[u8]) {
     let mut vec = accumulated_outputs.borrow_mut();
-    // let last_len = vec.len();
     vec.extend_from_slice(bytes_to_write);
-    // let next_len = vec.len();
-    // println!("RS Writing from {} to {}", last_len, next_len);
-    assert!(!vec.is_empty());
 }
 
 async fn send_set_request(
@@ -124,7 +118,6 @@ async fn send_set_request(
         .set(&buffer[key_range], &buffer[value_range])
         .await?;
     write_null_response_header(&accumulated_outputs, callback_index)?;
-    // println!("send_set_request");
     values_written_notifier.notify_one();
     Ok(())
 }
@@ -153,7 +146,7 @@ async fn send_get_request(
             write_null_response_header(&accumulated_outputs, callback_index)?;
         }
     };
-    // println!("send_get_request");
+
     values_written_notifier.notify_one();
     Ok(())
 }
@@ -222,7 +215,7 @@ async fn write_error(
     write_response_header(&accumulated_outputs, callback_index, response_type, length)
         .expect("Failed writing error to vec");
     write_slice_to_output(&accumulated_outputs, err.to_string().as_bytes());
-    // println!("write_error");
+
     values_written_notifier.notify_one();
 }
 
@@ -232,7 +225,6 @@ async fn handle_requests(
     accumulated_outputs: &Rc<RefCell<Vec<u8>>>,
     values_written_notifier: &Rc<Notify>,
 ) {
-    // TODO - can use pipeline here, if we're fine with the added latency.
     for request in received_requests {
         handle_request(
             request,
@@ -347,7 +339,6 @@ async fn read_values(
     loop {
         match client_listener.next_values().await {
             Closed(reason) => {
-                // println!("RS done read_values");
                 return Err(BabushkaError::CloseError(reason)); // TODO: implement error protocol, handle error closing reasons
             }
             ReceivedValues(received_requests) => {
@@ -370,17 +361,17 @@ async fn write_accumulated_outputs(
 ) -> Result<(), BabushkaError> {
     loop {
         let Some(mut write_request) = write_request_receiver.recv().await else {
-            // println!("RS done write_accumulated_outputs");
             return Err(BabushkaError::CloseError(ClosingReason2::AllConnectionsClosed));
         };
-        // looping is required since notified() might wake up with 2 permits - https://github.com/tokio-rs/tokio/pull/5305
+        // looping is required since notified() might have 2 permits - https://github.com/tokio-rs/tokio/pull/5305
         loop {
             read_possible.notified().await;
             let mut vec = accumulated_outputs.borrow_mut();
-            // possible in case of a data race
+            // possible in case of 2 permits
             if vec.is_empty() {
                 continue;
             }
+
             assert!(!vec.is_empty());
             let mut reference = write_request.buffer.as_mut().as_mut();
 
@@ -390,11 +381,6 @@ async fn write_accumulated_outputs(
                 read_possible.notify_one();
             }
             let remaining_vec_len = vec.len();
-            // println!(
-            //     "RS Written to socket {} bytes in range {:?}",
-            //     bytes_to_write,
-            //     reference.as_ptr_range()
-            // );
 
             let completion = write_request.completion;
             completion((bytes_to_write, remaining_vec_len));
@@ -428,7 +414,6 @@ async fn listen_on_client_stream(
         write_accumulated_outputs(&mut read_request_receiver, &accumulated_outputs, &notifier)
     )
     .map(|_| ());
-    // println!("RS done listen_on_client_stream");
     return result;
 }
 
