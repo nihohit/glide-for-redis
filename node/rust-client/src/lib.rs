@@ -1,5 +1,5 @@
-use napi::bindgen_prelude::{ToNapiValue, Uint8Array};
-use napi::{Env, Error, JsObject, Result, Status};
+use napi::bindgen_prelude::{AsyncTask, ToNapiValue, Uint8Array};
+use napi::{Env, Error, JsNumber, JsObject, Result, Status, Task};
 use napi_derive::napi;
 use redis::aio::MultiplexedConnection;
 use redis::socket_listener::headers::HEADER_END;
@@ -122,6 +122,27 @@ pub fn start_socket_listener_external(env: Env) -> Result<JsObject> {
     Ok(promise)
 }
 
+struct WriteTask {
+    sender: WriteSender,
+    buffer: Uint8Array,
+}
+
+impl Task for WriteTask {
+    type Output = u32;
+    type JsValue = JsNumber;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let vec = self.buffer.to_vec();
+        let len = vec.len();
+        self.sender.send(SocketWriteRequest::new(vec)).unwrap();
+        Ok(len as u32)
+    }
+
+    fn resolve(&mut self, env: Env, output: u32) -> Result<Self::JsValue> {
+        env.create_uint32(output)
+    }
+}
+
 #[napi]
 struct SocketLikeClient {
     #[allow(dead_code)]
@@ -140,17 +161,9 @@ impl SocketLikeClient {
 
     #[napi(ts_return_type = "Promise<number>")]
     #[allow(dead_code)]
-    pub fn write(&self, env: Env, buffer: Uint8Array) -> Result<JsObject> {
-        let (deferred, promise) = env.create_deferred()?;
-        let request = SocketWriteRequest::new(
-            Box::new(buffer),
-            Box::new(move |size| {
-                deferred.resolve(move |_| Ok(size as u32));
-            }),
-        );
-        let _ = self.write_sender.as_ref().unwrap().send(request);
-
-        Ok(promise)
+    pub fn write(&self, buffer: Uint8Array) -> AsyncTask<WriteTask> {
+        let sender = self.write_sender.clone().unwrap();
+        AsyncTask::new(WriteTask { sender, buffer })
     }
 
     #[napi(ts_return_type = "Promise<[number, number]>")]

@@ -18,7 +18,7 @@ use ClosingReason2::*;
 use PipeListeningResult::*;
 
 struct SocketListener {
-    write_request_receiver: UnboundedReceiver<SocketWriteRequest>,
+    read_request_receiver: UnboundedReceiver<SocketWriteRequest>,
     rotating_buffer: RotatingBuffer,
     values_written_notifier: Rc<Notify>,
 }
@@ -41,7 +41,7 @@ impl SocketListener {
     ) -> Self {
         let rotating_buffer = RotatingBuffer::new(2, 65_536);
         SocketListener {
-            write_request_receiver: read_request_receiver,
+            read_request_receiver,
             rotating_buffer,
             values_written_notifier,
         }
@@ -49,16 +49,11 @@ impl SocketListener {
 
     async fn next_values(&mut self) -> PipeListeningResult {
         loop {
-            let Some(read_request) = self.write_request_receiver.recv().await else {
+            let Some(mut read_request) = self.read_request_receiver.recv().await else {
                 return ReadSocketClosed.into();
             };
-            let reference = read_request.buffer.as_ref().as_ref();
-            self.rotating_buffer
-                .current_buffer()
-                .extend_from_slice(reference);
-
-            let completion = read_request.completion;
-            completion(reference.len());
+            let reference = read_request.buffer.as_mut();
+            self.rotating_buffer.current_buffer().append(reference);
 
             return match self.rotating_buffer.get_requests() {
                 Ok(requests) => ReceivedValues(requests),
@@ -464,8 +459,7 @@ pub enum SocketRequestType {
 
 ///
 pub struct SocketWriteRequest {
-    buffer: Box<dyn Deref<Target = [u8]>>,
-    completion: Box<dyn FnOnce(usize)>,
+    buffer: Vec<u8>,
 }
 
 ///
@@ -476,8 +470,8 @@ pub struct SocketReadRequest {
 
 impl SocketWriteRequest {
     ///
-    pub fn new(buffer: Box<dyn Deref<Target = [u8]>>, completion: Box<dyn FnOnce(usize)>) -> Self {
-        SocketWriteRequest { buffer, completion }
+    pub fn new(buffer: Vec<u8>) -> Self {
+        SocketWriteRequest { buffer }
     }
 }
 
