@@ -211,19 +211,19 @@ async function main(
         clients_to_run == "all" ||
         clients_to_run == "babushka"
     ) {
-        const babushka_socket_client = await SocketConnection.CreateConnection(
-            address
-        );
-        await run_client(
-            babushka_socket_client,
-            "babushka socket",
-            total_commands,
-            num_of_concurrent_tasks,
-            data_size,
-            data
-        );
-        babushka_socket_client.dispose();
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        // const babushka_socket_client = await SocketConnection.CreateConnection(
+        //     address
+        // );
+        // await run_client(
+        //     babushka_socket_client,
+        //     "babushka socket",
+        //     total_commands,
+        //     num_of_concurrent_tasks,
+        //     data_size,
+        //     data
+        // );
+        // babushka_socket_client.dispose();
+        // await new Promise((resolve) => setTimeout(resolve, 100));
 
         const babushka_socket_like_client =
             await SocketLikeConnection.CreateConnection(address);
@@ -263,7 +263,7 @@ const optionDefinitions = [
 const receivedOptions = commandLineArgs(optionDefinitions);
 
 const number_of_iterations = (num_of_concurrent_tasks: number) =>
-    Math.max(100000, num_of_concurrent_tasks * 10000);
+    Math.max(300000, num_of_concurrent_tasks * 30000);
 
 Promise.resolve() // just added to clean the indentation of the rest of the calls
     .then(async () => {
