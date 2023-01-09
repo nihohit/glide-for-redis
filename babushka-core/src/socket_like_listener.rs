@@ -1,9 +1,9 @@
-use super::super::{AsyncCommands, RedisResult};
 use super::{headers::*, rotating_buffer::RotatingBuffer};
-use crate::aio::MultiplexedConnection;
-use crate::{Client, RedisError};
 use bytes::BufMut;
 use num_traits::ToPrimitive;
+use redis::aio::MultiplexedConnection;
+use redis::{AsyncCommands, RedisResult};
+use redis::{Client, RedisError};
 use std::cell::RefCell;
 use std::cmp::min;
 use std::ops::{Deref, DerefMut, Range};

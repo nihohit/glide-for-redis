@@ -1,10 +1,14 @@
 use babushka::headers::HEADER_END;
-use babushka::{start_listener, start_socket_listener, ReadSender, WriteSender};
+use babushka::{
+    start_listener, start_socket_listener, ReadSender, SocketReadRequest, SocketWriteRequest,
+    WriteSender,
+};
 use napi::bindgen_prelude::ToNapiValue;
+use napi::bindgen_prelude::Uint8Array;
 use napi::{Env, Error, JsObject, Result, Status};
 use napi_derive::napi;
 use redis::aio::MultiplexedConnection;
-use redis::{AsyncCommands, RedisError, RedisResult};
+use redis::AsyncCommands;
 use std::str;
 use tokio::runtime::{Builder, Runtime};
 
