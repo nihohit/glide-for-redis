@@ -319,7 +319,7 @@ describe("socket memory client", () => {
                 "redis://localhost:" + port
             );
 
-            const WANTED_LENGTH = Math.pow(2, 11);
+            const WANTED_LENGTH = Math.pow(2, 16);
             const getLongUUID = () => {
                 let id = uuidv4();
                 while (id.length < WANTED_LENGTH) {
