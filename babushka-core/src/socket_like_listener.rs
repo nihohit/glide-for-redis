@@ -58,8 +58,10 @@ impl OutputAccumulator {
         self.pool.pop().unwrap_or_default()
     }
 
-    fn borrow_last_output(&mut self) -> &mut Vec<u8> {
-        self.buffers.front_mut().unwrap()
+    fn extend_last_output(&mut self, data: &[u8]) {
+        let buffer = self.buffers.back_mut().unwrap();
+        buffer.extend_from_slice(data);
+        self.length += data.len();
     }
 
     fn is_empty(&self) -> bool {
@@ -68,12 +70,10 @@ impl OutputAccumulator {
 
     fn fill_buffer(&mut self, buffer: &mut impl BufMut) -> (usize, usize) {
         let mut written_bytes = 0;
-        println!("start fill with {} {}", self.buffers.len(), self.length);
         loop {
             let Some(vec_ref) =  self.buffers.front() else {
                 break;
             };
-            println!("writing {} to {}", vec_ref.len(), buffer.remaining_mut());
             if vec_ref.len() + written_bytes > buffer.remaining_mut() {
                 break;
             }
@@ -160,8 +160,7 @@ fn write_null_response_header(
 
 fn write_slice_to_output(accumulated_outputs: &AccumulatedOutputs, bytes_to_write: &[u8]) {
     let mut accumulated_outputs = accumulated_outputs.borrow_mut();
-    let vec = accumulated_outputs.borrow_last_output();
-    vec.extend_from_slice(bytes_to_write);
+    accumulated_outputs.extend_last_output(bytes_to_write);
 }
 
 async fn send_set_request(

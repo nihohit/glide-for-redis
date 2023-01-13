@@ -40,7 +40,7 @@ export class SocketLikeConnection {
         const [bytesRead, bytesRemaining] = await this.socket.read(
             this.backingReadBuffer
         );
-        console.log(`${bytesRead} ${bytesRemaining}`);
+        // console.log(`${bytesRead} ${bytesRemaining}`);
 
         let counter = 0;
         while (counter <= bytesRead - HEADER_LENGTH_IN_BYTES) {
