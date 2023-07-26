@@ -208,7 +208,7 @@ impl ReconnectingConnection {
                 match get_multiplexed_connection(client).await {
                     Ok(mut connection) => {
                         if connection
-                            .send_packed_command(&redis::cmd("PING"))
+                            .send_packed_command("*1\r\n$4\r\nPING\r\n".as_bytes().to_vec().into())
                             .await
                             .is_err()
                         {

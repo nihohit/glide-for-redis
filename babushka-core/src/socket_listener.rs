@@ -1,7 +1,8 @@
 use super::rotating_buffer::RotatingBuffer;
 use crate::client::Client;
+use crate::command_args::{command_args, CommandArgs};
 use crate::connection_request::ConnectionRequest;
-use crate::redis_request::{command, redis_request};
+use crate::redis_request::redis_request;
 use crate::redis_request::{Command, RedisRequest, RequestType, Transaction};
 use crate::redis_request::{Routes, SlotTypes};
 use crate::response;
@@ -12,10 +13,10 @@ use dispose::{Disposable, Dispose};
 use futures::stream::StreamExt;
 use logger_core::{log_debug, log_error, log_info, log_trace, log_warn};
 use protobuf::Message;
+use redis::cluster_routing::ResponsePolicy;
 use redis::cluster_routing::{
     MultipleNodeRoutingInfo, Route, RoutingInfo, SingleNodeRoutingInfo, SlotAddr,
 };
-use redis::cluster_routing::{ResponsePolicy, Routable};
 use redis::RedisError;
 use redis::{cmd, Cmd, Value};
 use signal_hook::consts::signal::*;
@@ -334,7 +335,7 @@ fn get_command(request: &Command) -> Option<Cmd> {
     }
 }
 
-fn get_redis_command(command: &Command) -> Result<Cmd, ClienUsageError> {
+fn get_redis_command(command: &crate::redis_request::Command) -> Result<Cmd, ClienUsageError> {
     let Some(mut cmd) = get_command(command) else {
         return Err(ClienUsageError::InternalError(format!(
             "Received invalid request type: {:?}",
@@ -343,12 +344,12 @@ fn get_redis_command(command: &Command) -> Result<Cmd, ClienUsageError> {
     };
 
     match &command.args {
-        Some(command::Args::ArgsArray(args_vec)) => {
+        Some(crate::redis_request::command::Args::ArgsArray(args_vec)) => {
             for arg in args_vec.args.iter() {
                 cmd.arg(arg.as_bytes());
             }
         }
-        Some(command::Args::ArgsVecPointer(pointer)) => {
+        Some(crate::redis_request::command::Args::ArgsVecPointer(pointer)) => {
             let res = *unsafe { Box::from_raw(*pointer as *mut Vec<String>) };
             for arg in res {
                 cmd.arg(arg.as_bytes());
@@ -365,12 +366,11 @@ fn get_redis_command(command: &Command) -> Result<Cmd, ClienUsageError> {
 }
 
 async fn send_command(
-    cmd: Cmd,
-    mut client: Client,
-    routing: Option<RoutingInfo>,
+    mut connection: Client,
+    command: CommandArgs<protobuf::Chars>,
 ) -> ClientUsageResult<Value> {
-    client
-        .req_packed_command(&cmd, routing)
+    connection
+        .req_packed_command(command)
         .await
         .map_err(|err| err.into())
 }
@@ -388,7 +388,7 @@ async fn send_transaction(
     }
 
     client
-        .req_packed_commands(&pipeline, offset, 1, routing)
+        .req_packed_commands(pipeline.get_packed_pipeline().into(), offset, 1, routing)
         .await
         .map(|mut values| values.pop().unwrap_or(Value::Nil))
         .map_err(|err| err.into())
@@ -453,21 +453,10 @@ fn handle_request(request: RedisRequest, client: Client, writer: Rc<Writer>) {
     task::spawn_local(async move {
         let result = match request.command {
             Some(action) => match action {
-                redis_request::Command::SingleCommand(command) => {
-                    match get_redis_command(&command) {
-                        Ok(cmd) => {
-                            let response_policy = cmd
-                                .command()
-                                .map(|cmd| ResponsePolicy::for_command(&cmd))
-                                .unwrap_or(None);
-                            match get_route(request.route.0, response_policy) {
-                                Ok(routes) => send_command(cmd, client, routes).await,
-                                Err(e) => Err(e),
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
+                redis_request::Command::SingleCommand(command) => match command_args(command) {
+                    Ok(args) => send_command(client, args).await,
+                    Err(err) => Err(err),
+                },
                 redis_request::Command::Transaction(transaction) => {
                     match get_route(request.route.0, None) {
                         Ok(routes) => send_transaction(transaction, client, routes).await,
@@ -743,7 +732,7 @@ enum ClientCreationError {
 
 /// Enum describing errors received during client usage.
 #[derive(Debug, Error)]
-enum ClienUsageError {
+pub enum ClienUsageError {
     #[error("Redis error: {0}")]
     RedisError(#[from] RedisError),
     /// An error that stems from wrong behavior of the client.
@@ -751,7 +740,7 @@ enum ClienUsageError {
     InternalError(String),
 }
 
-type ClientUsageResult<T> = Result<T, ClienUsageError>;
+pub type ClientUsageResult<T> = Result<T, ClienUsageError>;
 
 /// Defines errors caused the connection to close.
 #[derive(Debug, Clone)]

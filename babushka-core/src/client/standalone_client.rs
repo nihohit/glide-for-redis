@@ -144,7 +144,10 @@ impl StandaloneClient {
         self.inner.nodes.get(self.inner.primary_index).unwrap()
     }
 
-    fn get_connection(&self, cmd: &redis::Cmd) -> &ReconnectingConnection {
+    fn get_connection<T: std::ops::Deref<Target = str> + Clone + Sync>(
+        &self,
+        cmd: &crate::command_args::CommandArgs<T>,
+    ) -> &ReconnectingConnection {
         if !is_readonly(cmd) || self.inner.nodes.len() == 1 {
             return self.get_primary_connection();
         }
@@ -184,11 +187,15 @@ impl StandaloneClient {
         }
     }
 
-    pub async fn send_packed_command(&mut self, cmd: &redis::Cmd) -> RedisResult<Value> {
+    pub async fn send_packed_command<T: std::ops::Deref<Target = str> + Clone + Sync>(
+        &mut self,
+        cmd: crate::command_args::CommandArgs<T>,
+    ) -> RedisResult<Value> {
         log_trace("StandaloneClient", "sending command");
-        let reconnecting_connection = self.get_connection(cmd);
+        let reconnecting_connection = self.get_connection(&cmd);
         let mut connection = reconnecting_connection.get_connection().await?;
-        let result = connection.send_packed_command(cmd).await;
+        let bytes = redis::pack_command_to_vec(cmd.iter()).into();
+        let result = connection.send_packed_command(bytes).await;
         match result {
             Err(err) if err.is_connection_dropped() => {
                 log_warn(
@@ -204,7 +211,7 @@ impl StandaloneClient {
 
     pub async fn send_packed_commands(
         &mut self,
-        cmd: &redis::Pipeline,
+        cmd: Arc<Vec<u8>>,
         offset: usize,
         count: usize,
     ) -> RedisResult<Vec<Value>> {
@@ -288,7 +295,12 @@ async fn get_connection_and_replication_info(
     };
 
     match multiplexed_connection
-        .send_packed_command(redis::cmd("INFO").arg("REPLICATION"))
+        .send_packed_command(
+            "*2\r\n$4\r\nINFO\r\n$11\r\nREPLICATION\r\n"
+                .as_bytes()
+                .to_vec()
+                .into(),
+        )
         .await
     {
         Ok(replication_status) => Ok((reconnecting_connection, replication_status)),

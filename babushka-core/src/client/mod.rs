@@ -11,6 +11,8 @@ use redis::{
 };
 pub use standalone_client::StandaloneClient;
 use std::io;
+
+use std::sync::Arc;
 use std::time::Duration;
 mod reconnecting_connection;
 mod standalone_client;
@@ -87,7 +89,7 @@ pub(super) fn get_connection_info(
 #[derive(Clone)]
 pub enum ClientWrapper {
     Standalone(StandaloneClient),
-    Cluster { client: ClusterConnection },
+    Cluster(ClusterConnection),
 }
 
 #[derive(Clone)]
@@ -107,40 +109,20 @@ async fn run_with_timeout<T>(
 }
 
 impl Client {
-    pub fn req_packed_command<'a>(
-        &'a mut self,
-        cmd: &'a redis::Cmd,
-        routing: Option<RoutingInfo>,
-    ) -> redis::RedisFuture<'a, redis::Value> {
-        run_with_timeout(self.request_timeout, async {
-            match self.internal_client {
-                ClientWrapper::Standalone(ref mut client) => client.send_packed_command(cmd).await,
-
-                ClientWrapper::Cluster { ref mut client } => {
-                    let routing = routing
-                        .or_else(|| RoutingInfo::for_routable(cmd))
-                        .unwrap_or(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random));
-                    client.route_command(cmd, routing).await
-                }
-            }
-        })
-        .boxed()
-    }
-
-    pub fn req_packed_commands<'a>(
-        &'a mut self,
-        cmd: &'a redis::Pipeline,
+    pub fn req_packed_commands(
+        &mut self,
+        cmd: Arc<Vec<u8>>,
         offset: usize,
         count: usize,
         routing: Option<RoutingInfo>,
-    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+    ) -> redis::RedisFuture<Vec<redis::Value>> {
         (async move {
             match self.internal_client {
                 ClientWrapper::Standalone(ref mut client) => {
                     client.send_packed_commands(cmd, offset, count).await
                 }
 
-                ClientWrapper::Cluster { ref mut client } => {
+                ClientWrapper::Cluster(ref mut client) => {
                     let route = match routing {
                         Some(RoutingInfo::SingleNode(route)) => route,
                         _ => SingleNodeRoutingInfo::Random,
@@ -269,7 +251,7 @@ impl Client {
                 let client = create_cluster_client(request)
                     .await
                     .map_err(ConnectionError::Cluster)?;
-                ClientWrapper::Cluster { client }
+                ClientWrapper::Cluster(client)
             } else {
                 ClientWrapper::Standalone(
                     StandaloneClient::create_client(request)
@@ -286,5 +268,24 @@ impl Client {
         .await
         .map_err(|_| ConnectionError::Timeout)
         .and_then(|res| res)
+    }
+
+    pub async fn req_packed_command<T: std::ops::Deref<Target = str> + Clone + Sync + Send>(
+        &mut self,
+        cmd: crate::command_args::CommandArgs<T>,
+    ) -> RedisResult<redis::Value> {
+        run_with_timeout(self.request_timeout, async move {
+            match self.internal_client {
+                ClientWrapper::Standalone(ref mut client) => client.send_packed_command(cmd).await,
+
+                ClientWrapper::Cluster(ref mut client) => {
+                    let routing = redis::cluster_routing::RoutingInfo::for_routable(&cmd)
+                        .unwrap_or(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random));
+                    let bytes = redis::pack_command_to_vec(cmd.iter()).into();
+                    client.route_command(bytes, routing).await
+                }
+            }
+        })
+        .await
     }
 }

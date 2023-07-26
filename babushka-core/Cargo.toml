@@ -26,6 +26,8 @@ thiserror = "1"
 rand = "0.8.5"
 futures-intrusive = "0.5.0"
 directories = "5.0"
+dhat = "0.3.2"
+itoa = "1.0.6"
 
 [dev-dependencies]
 rsevents = "0.3.1"
@@ -43,14 +45,7 @@ once_cell = "1.18.0"
 [build-dependencies]
 protobuf-codegen = "3"
 
-[[bench]]
-name = "rotating_buffer_benchmark"
-harness = false
 
 [[bench]]
-name = "connections_benchmark"
-harness = false
-
-[[bench]]
-name = "memory_benchmark"
+name = "silly_benchmark"
 harness = false

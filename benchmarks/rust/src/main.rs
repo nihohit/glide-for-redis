@@ -253,7 +253,7 @@ async fn single_benchmark_task(
         let index = current_op % connections.len();
         let mut connection = connections[index].clone();
         stopwatch.restart();
-        let action = perform_operation(&mut connection, &mut buffer, data_size).await;
+        let action = perform_operation(&mut connection, data_size, &mut buffer).await;
         stopwatch.stop();
         results.get_mut(&action).unwrap().push(stopwatch.elapsed());
     }
@@ -261,26 +261,41 @@ async fn single_benchmark_task(
 
 async fn perform_operation(
     connection: &mut Client,
-    buffer: &mut itoa::Buffer,
     data_size: usize,
+    buffer: &mut itoa::Buffer,
 ) -> ChosenAction {
-    let mut cmd = redis::Cmd::new();
+    let cmd;
     let action = if rand::thread_rng().gen_bool(PROB_GET) {
         if rand::thread_rng().gen_bool(PROB_GET_EXISTING_KEY) {
-            cmd.arg("GET")
-                .arg(buffer.format(thread_rng().gen_range(0..SIZE_SET_KEYSPACE)));
+            cmd = vec![
+                "GET".to_string(),
+                buffer
+                    .format(thread_rng().gen_range(0..SIZE_SET_KEYSPACE))
+                    .to_string(),
+            ];
             ChosenAction::GetExisting
         } else {
-            cmd.arg("GET")
-                .arg(buffer.format(thread_rng().gen_range(SIZE_SET_KEYSPACE..SIZE_GET_KEYSPACE)));
+            cmd = vec![
+                "GET".to_string(),
+                buffer
+                    .format(thread_rng().gen_range(SIZE_SET_KEYSPACE..SIZE_GET_KEYSPACE))
+                    .to_string(),
+            ];
+
             ChosenAction::GetNonExisting
         }
     } else {
-        cmd.arg("SET")
-            .arg(buffer.format(thread_rng().gen_range(0..SIZE_SET_KEYSPACE)))
-            .arg(generate_random_string(data_size));
+        let str = generate_random_string(data_size);
+        cmd = vec![
+            "SET".to_string(),
+            buffer
+                .format(thread_rng().gen_range(0..SIZE_SET_KEYSPACE))
+                .to_string(),
+            str,
+        ];
         ChosenAction::Set
     };
-    connection.req_packed_command(&cmd, None).await.unwrap();
+    let command_args = babushka::command_args::CommandArgs::new(cmd);
+    connection.req_packed_command(command_args).await.unwrap();
     action
 }
