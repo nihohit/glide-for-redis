@@ -5,16 +5,22 @@ mod standalone_client_tests {
     use crate::utilities::mocks::{Mock, ServerMock};
 
     use super::*;
-    use babushka::{client::StandaloneClient, connection_request::ReadFrom};
+    use babushka::{
+        client::StandaloneClient, command_args::CommandArgs, connection_request::ReadFrom,
+    };
     use redis::{FromRedisValue, Value};
     use rstest::rstest;
     use utilities::*;
 
     async fn kill_connection(client: &mut StandaloneClient) {
-        let mut client_kill_cmd = redis::cmd("CLIENT");
-        client_kill_cmd.arg("KILL").arg("SKIPME").arg("NO");
+        let client_kill_cmd = CommandArgs::new(vec![
+            "CLIENT".into(),
+            "KILL".into(),
+            "SKIPME".into(),
+            "NO".into(),
+        ]);
 
-        let _ = client.send_packed_command(&client_kill_cmd).await.unwrap();
+        let _ = client.send_packed_command(client_kill_cmd).await.unwrap();
     }
 
     #[rstest]
@@ -33,11 +39,11 @@ mod standalone_client_tests {
 
             kill_connection(&mut client).await;
 
-            let mut get_command = redis::Cmd::new();
-            get_command
-                .arg("GET")
-                .arg("test_report_disconnect_and_reconnect_after_temporary_disconnect");
-            let error = client.send_packed_command(&get_command).await;
+            let get_command = CommandArgs::new(vec![
+                "GET".into(),
+                "test_report_disconnect_and_reconnect_after_temporary_disconnect".into(),
+            ]);
+            let error = client.send_packed_command(get_command.clone()).await;
             assert!(error.is_err(), "{error:?}",);
             let error = error.unwrap_err();
             assert!(
@@ -47,7 +53,7 @@ mod standalone_client_tests {
 
             let get_result = repeat_try_create(|| async {
                 let mut client = client.clone();
-                client.send_packed_command(&get_command).await.ok()
+                client.send_packed_command(get_command.clone()).await.ok()
             })
             .await;
             assert_eq!(get_result, Value::Nil);
@@ -151,6 +157,7 @@ mod standalone_client_tests {
         let mut mocks = create_primary_mock_with_replicas(
             config.number_of_initial_replicas - config.number_of_missing_replicas,
         );
+
         let mut cmd = redis::cmd("GET");
         cmd.arg("foo");
 
@@ -173,6 +180,7 @@ mod standalone_client_tests {
             create_connection_request(addresses.as_slice(), &Default::default());
         connection_request.read_from = config.read_from.into();
 
+        let cmd = CommandArgs::new(vec!["GET".into(), "foo".into()]);
         block_on_all(async {
             let mut client = StandaloneClient::create_client(connection_request)
                 .await
@@ -181,7 +189,7 @@ mod standalone_client_tests {
                 mock.close().await;
             }
             for _ in 0..config.number_of_requests_sent {
-                let _ = client.send_packed_command(&cmd).await;
+                let _ = client.send_packed_command(cmd.clone()).await;
             }
         });
 
@@ -268,8 +276,7 @@ mod standalone_client_tests {
     #[rstest]
     #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
     fn test_set_database_id_after_reconnection() {
-        let mut client_info_cmd = redis::Cmd::new();
-        client_info_cmd.arg("CLIENT").arg("INFO");
+        let client_info_cmd = CommandArgs::new(vec!["CLIENT".into(), "INFO".into()]);
         block_on_all(async move {
             let test_basics = setup_test_basics_internal(&TestConfiguration {
                 database_id: 4,
@@ -280,14 +287,17 @@ mod standalone_client_tests {
             let mut client = test_basics.client;
 
             let client_info = String::from_redis_value(
-                &client.send_packed_command(&client_info_cmd).await.unwrap(),
+                &client
+                    .send_packed_command(client_info_cmd.clone())
+                    .await
+                    .unwrap(),
             )
             .unwrap();
             assert!(client_info.contains("db=4"));
 
             kill_connection(&mut client).await;
 
-            let error = client.send_packed_command(&client_info_cmd).await;
+            let error = client.send_packed_command(client_info_cmd.clone()).await;
             assert!(error.is_err(), "{error:?}",);
             let error = error.unwrap_err();
             assert!(
@@ -298,7 +308,10 @@ mod standalone_client_tests {
             let client_info = repeat_try_create(|| async {
                 let mut client = client.clone();
                 String::from_redis_value(
-                    &client.send_packed_command(&client_info_cmd).await.unwrap(),
+                    &client
+                        .send_packed_command(client_info_cmd.clone())
+                        .await
+                        .unwrap(),
                 )
                 .ok()
             })

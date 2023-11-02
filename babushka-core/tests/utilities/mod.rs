@@ -520,21 +520,18 @@ pub fn generate_random_string(length: usize) -> String {
 }
 
 pub async fn send_get(client: &mut Client, key: &str) -> RedisResult<Value> {
-    let mut get_command = redis::Cmd::new();
-    get_command.arg("GET").arg(key);
-    client.req_packed_command(&get_command).await
+    let get_command = CommandArgs::new(vec!["GET".into(), key.into()]);
+    client.req_packed_command(get_command).await
 }
 
 pub async fn send_set_and_get(mut client: Client, key: String) {
     const VALUE_LENGTH: usize = 10;
     let value = generate_random_string(VALUE_LENGTH);
 
-    let mut set_command = redis::Cmd::new();
-    set_command.arg("SET").arg(key.as_str()).arg(value.clone());
-    let set_result = client.req_packed_command(&set_command).await.unwrap();
-    let mut get_command = redis::Cmd::new();
-    get_command.arg("GET").arg(key);
-    let get_result = client.req_packed_command(&get_command).await.unwrap();
+    let set_command = CommandArgs::new(vec!["SET".into(), key.clone(), value.clone()]);
+    let set_result = client.req_packed_command(set_command).await.unwrap();
+    let get_command = CommandArgs::new(vec!["GET".into(), key]);
+    let get_result = client.req_packed_command(get_command).await.unwrap();
 
     assert_eq!(set_result, Value::Okay);
     assert_eq!(get_result, Value::BulkString(value.into_bytes()));
