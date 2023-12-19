@@ -1,5 +1,6 @@
 use babushka::connection_request;
 use babushka::{client::Client as BabushkaClient, connection_request::NodeAddress};
+use logger_core::log_info;
 use redis::{Cmd, FromRedisValue, RedisResult};
 use std::{
     ffi::{c_void, CStr, CString},
@@ -7,6 +8,7 @@ use std::{
 };
 use tokio::runtime::Builder;
 use tokio::runtime::Runtime;
+use tokio::task::LocalSet;
 
 pub enum Level {
     Error = 0,
@@ -21,6 +23,8 @@ pub struct Client {
     success_callback: unsafe extern "C" fn(usize, *const c_char) -> (),
     failure_callback: unsafe extern "C" fn(usize) -> (), // TODO - add specific error codes
     runtime: Runtime,
+    // TODO - this limits us to a single thread per-client. If we want to improve performance, we'll need to change `BabushkaClient` to be Send + Sync.
+    local_set: LocalSet,
 }
 
 fn create_connection_request(
@@ -55,16 +59,21 @@ fn create_client_internal(
     let host_string = host_cstring.to_str()?.to_string();
     let request = create_connection_request(host_string, port, use_tls);
     let runtime = Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .thread_name("Babushka C# thread")
         .build()?;
-    let _runtime_handle = runtime.enter();
-    let client = runtime.block_on(BabushkaClient::new(request)).unwrap(); // TODO - handle errors.
+
+    let local_set = LocalSet::new();
+    let client = local_set
+        .block_on(&runtime, BabushkaClient::new(request))
+        .unwrap(); // TODO - handle errors.
     Ok(Client {
         client,
         success_callback,
         failure_callback,
         runtime,
+        local_set,
     })
 }
 
@@ -105,20 +114,26 @@ pub extern "C" fn set(
     let key_cstring = unsafe { CStr::from_ptr(key as *mut c_char) };
     let value_cstring = unsafe { CStr::from_ptr(value as *mut c_char) };
     let mut client_clone = client.client.clone();
-    client.runtime.spawn(async move {
-        let key_bytes = key_cstring.to_bytes();
-        let value_bytes = value_cstring.to_bytes();
-        let mut cmd = Cmd::new();
-        cmd.arg("SET").arg(key_bytes).arg(value_bytes);
-        let result = client_clone.req_packed_command(&cmd, None).await;
-        unsafe {
-            let client = Box::leak(Box::from_raw(ptr_address as *mut Client));
-            match result {
-                Ok(_) => (client.success_callback)(callback_index, std::ptr::null()), // TODO - should return "OK" string.
-                Err(_) => (client.failure_callback)(callback_index), // TODO - report errors
-            };
-        }
-    });
+    log_info("set", "before runtime");
+    client
+        .runtime
+        .spawn(client.local_set.spawn_local(async move {
+            log_info("set", "spawned locally");
+            let key_bytes = key_cstring.to_bytes();
+            let value_bytes = value_cstring.to_bytes();
+            let mut cmd = Cmd::new();
+            cmd.arg("SET").arg(key_bytes).arg(value_bytes);
+            log_info("set", "pre-await");
+            let result = client_clone.req_packed_command(&cmd, None).await;
+            log_info("set", "completed");
+            unsafe {
+                let client = Box::leak(Box::from_raw(ptr_address as *mut Client));
+                match result {
+                    Ok(_) => (client.success_callback)(callback_index, std::ptr::null()), // TODO - should return "OK" string.
+                    Err(_) => (client.failure_callback)(callback_index), // TODO - report errors
+                };
+            }
+        }));
 }
 
 /// Expects that key will be kept valid until the callback is called. If the callback is called with a string pointer, the pointer must
@@ -131,10 +146,14 @@ pub extern "C" fn get(client_ptr: *const c_void, callback_index: usize, key: *co
 
     let key_cstring = unsafe { CStr::from_ptr(key as *mut c_char) };
     let mut client_clone = client.client.clone();
-    client.runtime.spawn(async move {
+    log_info("get", "before runtime");
+    client.runtime.spawn(client.local_set.run_until(async move {
+        log_info("get", "spawned locally");
         let key_bytes = key_cstring.to_bytes();
         let mut cmd = Cmd::new();
+        log_info("get", "pre-await");
         cmd.arg("GET").arg(key_bytes);
+        log_info("get", "completed");
         let result = client_clone.req_packed_command(&cmd, None).await;
         let client = unsafe { Box::leak(Box::from_raw(ptr_address as *mut Client)) };
         let value = match result {
@@ -153,7 +172,7 @@ pub extern "C" fn get(client_ptr: *const c_void, callback_index: usize, key: *co
                 Err(_) => (client.failure_callback)(callback_index), // TODO - report errors
             };
         }
-    });
+    }));
 }
 
 impl From<logger_core::Level> for Level {

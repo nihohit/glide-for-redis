@@ -8,7 +8,7 @@ public class AsyncClientTests
     [OneTimeSetUp]
     public void Setup()
     {
-        babushka.Logger.SetLoggerConfig(babushka.Level.Info);
+        babushka.Logger.SetLoggerConfig(babushka.Level.Trace);
     }
 
     private async Task GetAndSetRandomValues(AsyncClient client)
