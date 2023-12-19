@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 use tempfile::TempDir;
+use tokio::task::LocalSet;
 
 pub mod cluster;
 pub mod mocks;
@@ -486,7 +487,10 @@ pub fn block_on_all<F>(f: F) -> F::Output
 where
     F: Future,
 {
-    current_thread_runtime().block_on(f)
+    current_thread_runtime().block_on(async {
+        let local_set = LocalSet::new();
+        local_set.run_until(f).await
+    })
 }
 
 pub fn get_address_info(address: &ConnectionAddr) -> NodeAddress {
