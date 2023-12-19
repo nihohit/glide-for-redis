@@ -1,21 +1,22 @@
 use crate::connection_request::{NodeAddress, TlsMode};
 use crate::retry_strategies::RetryStrategy;
-use futures_intrusive::sync::LocalManualResetEvent;
+use futures_intrusive::sync::{LocalManualResetEvent, ManualResetEvent};
 use logger_core::{log_debug, log_trace, log_warn};
 use redis::aio::MultiplexedConnection;
 use redis::{RedisConnectionInfo, RedisError, RedisResult};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_retry::Retry;
 
 use super::{run_with_timeout, DEFAULT_CONNECTION_ATTEMPT_TIMEOUT};
 
 /// The object that is used in order to recreate a connection after a disconnect.
-struct ConnectionBackend {
+struct ConnectionBackend<ResetEvent> {
     /// This signal is reset when a connection disconnects, and set when a new `ConnectionState` has been set with a `Connected` state.
-    connection_available_signal: LocalManualResetEvent,
+    connection_available_signal: ResetEvent,
     /// Information needed in order to create a new connection.
     connection_info: redis::Client,
     /// Once this flag is set, the internal connection needs no longer try to reconnect to the server, because all the outer clients were dropped.
@@ -32,15 +33,21 @@ enum ConnectionState {
     InitializedDisconnected,
 }
 
-struct InnerReconnectingConnection {
-    state: RefCell<ConnectionState>,
-    backend: ConnectionBackend,
+struct InnerReconnectingConnection<InternalMutability, ResetEvent> {
+    state: InternalMutability,
+    backend: ConnectionBackend<ResetEvent>,
 }
 
 #[derive(Clone)]
-pub(super) struct ReconnectingConnection {
-    inner: Rc<InnerReconnectingConnection>,
+pub(super) struct ReconnectingConnection<Inner> {
+    inner: Inner,
 }
+
+type LocalInner = InnerReconnectingConnection<RefCell<ConnectionState>, LocalManualResetEvent>;
+type LocalReconnectingConnection = ReconnectingConnection<Rc<LocalInner>>;
+
+type MultiThreadInner = InnerReconnectingConnection<Mutex<ConnectionState>, ManualResetEvent>;
+type MultiThreadReconnectingConnection = ReconnectingConnection<Arc<MultiThreadInner>>;
 
 async fn get_multiplexed_connection(client: &redis::Client) -> RedisResult<MultiplexedConnection> {
     run_with_timeout(
@@ -50,10 +57,10 @@ async fn get_multiplexed_connection(client: &redis::Client) -> RedisResult<Multi
     .await
 }
 
-async fn create_connection(
-    connection_backend: ConnectionBackend,
+async fn create_connection<Connection, Backend>(
+    connection_backend: Backend,
     retry_strategy: RetryStrategy,
-) -> Result<ReconnectingConnection, (ReconnectingConnection, RedisError)> {
+) -> Result<Connection, (Connection, RedisError)> {
     let client = &connection_backend.connection_info;
     let action = || get_multiplexed_connection(client);
 
@@ -124,13 +131,13 @@ fn internal_retry_iterator() -> impl Iterator<Item = Duration> {
     .chain(std::iter::repeat(MAX_DURATION))
 }
 
-impl ReconnectingConnection {
+impl<Inner> ReconnectingConnection<Inner> {
     pub(super) async fn new(
         address: &NodeAddress,
         connection_retry_strategy: RetryStrategy,
         redis_connection_info: RedisConnectionInfo,
         tls_mode: TlsMode,
-    ) -> Result<ReconnectingConnection, (ReconnectingConnection, RedisError)> {
+    ) -> Result<ReconnectingConnection<Inner>, (ReconnectingConnection<Inner>, RedisError)> {
         log_debug(
             "connection creation",
             format!("Attempting connection to {address}"),
