@@ -20,14 +20,14 @@ enum ReadFrom {
     },
 }
 
-struct DropWrapper<ConnectionInner> {
+struct DropWrapper {
     /// Connection to the primary node in the client.
     primary_index: usize,
-    nodes: Vec<ReconnectingConnection<ConnectionInner>>,
+    nodes: Vec<ReconnectingConnection>,
     read_from: ReadFrom,
 }
 
-impl<ConnectionInner> Drop for DropWrapper<ConnectionInner> {
+impl Drop for DropWrapper {
     fn drop(&mut self) {
         for node in self.nodes.iter() {
             node.mark_as_dropped();
@@ -36,8 +36,8 @@ impl<ConnectionInner> Drop for DropWrapper<ConnectionInner> {
 }
 
 #[derive(Clone)]
-pub struct StandaloneClient<RefCountDropWrapper> {
-    inner: RefCountDropWrapper,
+pub struct StandaloneClient {
+    inner: Rc<DropWrapper>,
 }
 
 pub enum StandaloneClientConnectionError {
