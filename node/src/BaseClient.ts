@@ -171,6 +171,8 @@ export class BaseClient {
     private writeInProgress = false;
     private remainingReadData: Uint8Array | undefined;
     private readonly requestTimeout: number; // Timeout in milliseconds
+    // @ts-ignore:next-line
+    private static finalizationRegistry: FinalizationRegistry;
 
     private handleReadData(data: Buffer) {
         const buf = this.remainingReadData
@@ -921,30 +923,71 @@ export class BaseClient {
     }
 
     public dispose(errorMessage?: string): void {
-        this.promiseCallbackFunctions.forEach(([, reject]) => {
+        BaseClient.disposeInternal(
+            this.promiseCallbackFunctions,
+            this.socket,
+            errorMessage
+        );
+    }
+
+    private static disposeInternal(
+        promiseCallbackFunctions: [PromiseFunction, ErrorFunction][],
+        socket: net.Socket,
+        errorMessage?: string
+    ): void {
+        promiseCallbackFunctions.forEach(([, reject]) => {
             reject(new ClosingError(errorMessage));
         });
         Logger.log("info", "Client lifetime", "disposing of client");
-        this.socket.end();
+        socket.end();
+    }
+
+    private registerForGarbageCollection() {
+        if (BaseClient.finalizationRegistry == null) {
+            // @ts-ignore:next-line
+            BaseClient.finalizationRegistry = new FinalizationRegistry(
+                (obj: {
+                    // promiseCallbackFunctions: [
+                    //     PromiseFunction,
+                    //     ErrorFunction
+                    // ][];
+                    // socket: net.Socket;
+                }) => {
+                    console.log("garbage was collected!!!1");
+                    Logger.log("error", "foo", "garbage was collected!");
+                    // BaseClient.disposeInternal(
+                    //     obj.promiseCallbackFunctions,
+                    //     obj.socket,
+                    //     "Client was garbage collected"
+                    // );
+                }
+            );
+        }
+        const res = BaseClient.finalizationRegistry.register(this, {
+            // promiseCallbackFunctions: this.promiseCallbackFunctions,
+            // socket: this.socket,
+        });
+        console.log(
+            `registered for GC ${res} ${BaseClient.finalizationRegistry}`
+        );
     }
 
     /**
      * @internal
      */
-    protected static async __createClientInternal<
-        TConnection extends BaseClient
-    >(
+    protected static async __createClientInternal<TClient extends BaseClient>(
         options: BaseClientConfiguration,
         connectedSocket: net.Socket,
         constructor: (
             socket: net.Socket,
             options?: BaseClientConfiguration
-        ) => TConnection
-    ): Promise<TConnection> {
-        const connection = constructor(connectedSocket, options);
-        await connection.connectToServer(options);
+        ) => TClient
+    ): Promise<TClient> {
+        const client = constructor(connectedSocket, options);
+        client.registerForGarbageCollection();
+        await client.connectToServer(options);
         Logger.log("info", "Client lifetime", "connected to server");
-        return connection;
+        return client;
     }
 
     /**
@@ -963,16 +1006,16 @@ export class BaseClient {
     /**
      * @internal
      */
-    protected static async createClientInternal<TConnection extends BaseClient>(
+    protected static async createClientInternal<TClient extends BaseClient>(
         options: BaseClientConfiguration,
         constructor: (
             socket: net.Socket,
             options?: BaseClientConfiguration
-        ) => TConnection
-    ): Promise<TConnection> {
+        ) => TClient
+    ): Promise<TClient> {
         const path = await StartSocketConnection();
         const socket = await this.GetSocket(path);
-        return await this.__createClientInternal<TConnection>(
+        return await this.__createClientInternal<TClient>(
             options,
             socket,
             constructor

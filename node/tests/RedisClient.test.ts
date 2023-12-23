@@ -145,21 +145,28 @@ describe("RedisClient", () => {
     });
 
     it("can return null on WATCH transaction failures", async () => {
-        const client1 = await RedisClient.createClient(getOptions(port));
-        const client2 = await RedisClient.createClient(getOptions(port));
-        const transaction = new Transaction();
-        transaction.get("key");
-        const result1 = await client1.customCommand("WATCH", ["key"]);
-        expect(result1).toEqual("OK");
+        {
+            let client1: RedisClient | undefined =
+                await RedisClient.createClient(getOptions(port));
+            let client2 = await RedisClient.createClient(getOptions(port));
+            const transaction = new Transaction();
+            transaction.get("key");
+            const result1 = await client1?.customCommand("WATCH", ["key"]);
+            expect(result1).toEqual("OK");
 
-        const result2 = await client2.set("key", "foo");
-        expect(result2).toEqual("OK");
+            const result2 = await client2.set("key", "foo");
+            expect(result2).toEqual("OK");
 
-        const result3 = await client1.exec(transaction);
-        expect(result3).toBeNull();
+            const result3 = await client1?.exec(transaction);
+            expect(result3).toBeNull();
+            client1 = undefined;
+        }
+        console.log("scope was left");
+        // @ts-ignore:next-line
+        global.gc(true);
 
-        client1.dispose();
-        client2.dispose();
+        // client1.dispose();
+        // client2.dispose();
     });
 
     runBaseTests<Context>({
