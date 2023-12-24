@@ -160,6 +160,14 @@ function getRequestErrorClass(
     return RequestError;
 }
 
+type WriteSync = {
+    writeInProgress: boolean;
+};
+
+type DataContainer = {
+    remainingReadData: Uint8Array | undefined;
+};
+
 export class BaseClient {
     private socket: net.Socket;
     private readonly promiseCallbackFunctions: [
@@ -168,15 +176,21 @@ export class BaseClient {
     ][] = [];
     private readonly availableCallbackSlots: number[] = [];
     private requestWriter = new BufferWriter();
-    private writeInProgress = false;
-    private remainingReadData: Uint8Array | undefined;
+    private writeInProgress: WriteSync = { writeInProgress: false };
+    private dataContainer: DataContainer = { remainingReadData: undefined };
     private readonly requestTimeout: number; // Timeout in milliseconds
     // @ts-ignore:next-line
     private static finalizationRegistry: FinalizationRegistry;
 
-    private handleReadData(data: Buffer) {
-        const buf = this.remainingReadData
-            ? Buffer.concat([this.remainingReadData, data])
+    private static handleReadData(
+        data: Buffer,
+        dataContainer: DataContainer,
+        promiseCallbackFunctions: [PromiseFunction, ErrorFunction][],
+        availableCallbackSlots: number[],
+        socket: net.Socket
+    ) {
+        const buf = dataContainer.remainingReadData
+            ? Buffer.concat([dataContainer.remainingReadData, data])
             : data;
         let lastPos = 0;
         const reader = Reader.create(buf);
@@ -188,23 +202,31 @@ export class BaseClient {
             } catch (err) {
                 if (err instanceof RangeError) {
                     // Partial response received, more data is required
-                    this.remainingReadData = buf.slice(lastPos);
+                    dataContainer.remainingReadData = buf.slice(lastPos);
                     return;
                 } else {
                     // Unhandled error
                     const err_message = `Failed to decode the response: ${err}`;
                     Logger.log("error", "connection", err_message);
-                    this.dispose(err_message);
+                    BaseClient.disposeInternal(
+                        promiseCallbackFunctions,
+                        socket,
+                        err_message
+                    );
                     return;
                 }
             }
             if (message.closingError != null) {
-                this.dispose(message.closingError);
+                BaseClient.disposeInternal(
+                    promiseCallbackFunctions,
+                    socket,
+                    message.closingError
+                );
                 return;
             }
             const [resolve, reject] =
-                this.promiseCallbackFunctions[message.callbackIdx];
-            this.availableCallbackSlots.push(message.callbackIdx);
+                promiseCallbackFunctions[message.callbackIdx];
+            availableCallbackSlots.push(message.callbackIdx);
             if (message.requestError != null) {
                 const errorType = getRequestErrorClass(
                     message.requestError.type
@@ -227,7 +249,7 @@ export class BaseClient {
                 resolve(null);
             }
         }
-        this.remainingReadData = undefined;
+        dataContainer.remainingReadData = undefined;
     }
 
     /**
@@ -242,11 +264,22 @@ export class BaseClient {
         this.requestTimeout =
             options?.requestTimeout ?? DEFAULT_TIMEOUT_IN_MILLISECONDS;
         this.socket = socket;
+        const dataContainer = this.dataContainer;
+        const promiseCallbackFunctions = this.promiseCallbackFunctions;
+        const availableCallbackSlots = this.availableCallbackSlots;
         this.socket
-            .on("data", (data) => this.handleReadData(data))
+            .on("data", (data) => {
+                BaseClient.handleReadData(
+                    data,
+                    dataContainer,
+                    promiseCallbackFunctions,
+                    availableCallbackSlots,
+                    socket
+                );
+            })
             .on("error", (err) => {
                 console.error(`Server closed: ${err}`);
-                this.dispose();
+                BaseClient.disposeInternal(promiseCallbackFunctions, socket);
             });
     }
 
@@ -257,16 +290,24 @@ export class BaseClient {
         );
     }
 
-    private writeBufferedRequestsToSocket() {
-        this.writeInProgress = true;
-        const requests = this.requestWriter.finish();
-        this.requestWriter.reset();
+    private static writeBufferedRequestsToSocket(
+        requestWriter: BufferWriter,
+        socket: net.Socket,
+        writeSync: WriteSync
+    ) {
+        writeSync.writeInProgress = true;
+        const requests = requestWriter.finish();
+        requestWriter.reset();
 
-        this.socket.write(requests, undefined, () => {
-            if (this.requestWriter.len > 0) {
-                this.writeBufferedRequestsToSocket();
+        socket.write(requests, undefined, () => {
+            if (requestWriter.len > 0) {
+                BaseClient.writeBufferedRequestsToSocket(
+                    requestWriter,
+                    socket,
+                    writeSync
+                );
             } else {
-                this.writeInProgress = false;
+                writeSync.writeInProgress = false;
             }
         });
     }
@@ -278,15 +319,29 @@ export class BaseClient {
         command: redis_request.Command | redis_request.Command[],
         route?: redis_request.Routes
     ): Promise<T> {
+        const callbackIndex = this.getCallbackIndex();
+        const promiseCallbackFunctions = this.promiseCallbackFunctions;
+        const requestWriter = this.requestWriter;
+        const writeSync = this.writeInProgress;
+        const socket = this.socket;
         return new Promise((resolve, reject) => {
-            const callbackIndex = this.getCallbackIndex();
-            this.promiseCallbackFunctions[callbackIndex] = [resolve, reject];
-            this.writeOrBufferRedisRequest(callbackIndex, command, route);
+            promiseCallbackFunctions[callbackIndex] = [resolve, reject];
+            BaseClient.writeOrBufferRedisRequest(
+                callbackIndex,
+                requestWriter,
+                writeSync,
+                socket,
+                command,
+                route
+            );
         });
     }
 
-    private writeOrBufferRedisRequest(
+    private static writeOrBufferRedisRequest(
         callbackIdx: number,
+        requestWriter: BufferWriter,
+        writeSync: WriteSync,
+        socket: net.Socket,
         command: redis_request.Command | redis_request.Command[],
         route?: redis_request.Routes
     ) {
@@ -305,21 +360,27 @@ export class BaseClient {
 
         this.writeOrBufferRequest(
             message,
+            requestWriter,
+            writeSync,
+            socket,
             (message: redis_request.RedisRequest, writer: Writer) => {
                 redis_request.RedisRequest.encodeDelimited(message, writer);
             }
         );
     }
 
-    private writeOrBufferRequest<TRequest>(
+    private static writeOrBufferRequest<TRequest>(
         message: TRequest,
+        requestWriter: BufferWriter,
+        writeSync: WriteSync,
+        socket: net.Socket,
         encodeDelimited: (message: TRequest, writer: Writer) => void
     ) {
-        encodeDelimited(message, this.requestWriter);
-        if (this.writeInProgress) {
+        encodeDelimited(message, requestWriter);
+        if (writeSync.writeInProgress) {
             return;
         }
-        this.writeBufferedRequestsToSocket();
+        this.writeBufferedRequestsToSocket(requestWriter, socket, writeSync);
     }
 
     /** Get the value associated with the given key, or null if no such value exists.
@@ -900,6 +961,9 @@ export class BaseClient {
      * @internal
      */
     protected connectToServer(options: BaseClientConfiguration): Promise<void> {
+        const socket = this.socket;
+        const requestWriter = this.requestWriter;
+        const writeSync = this.writeInProgress;
         return new Promise((resolve, reject) => {
             this.promiseCallbackFunctions[0] = [resolve, reject];
 
@@ -907,8 +971,11 @@ export class BaseClient {
                 this.createClientRequest(options)
             );
 
-            this.writeOrBufferRequest(
+            BaseClient.writeOrBufferRequest(
                 message,
+                requestWriter,
+                writeSync,
+                socket,
                 (
                     message: connection_request.ConnectionRequest,
                     writer: Writer
