@@ -25,5 +25,6 @@ module.exports = {
             { blankLine: "always", prev: "*", next: "multiline-block-like" },
             { blankLine: "always", prev: "multiline-block-like", next: "*" },
         ],
+        "max-len": ["error", { code: 80 }, { comments: 80 }],
     },
 };
