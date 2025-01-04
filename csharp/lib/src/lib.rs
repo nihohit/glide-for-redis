@@ -94,7 +94,7 @@ pub extern "C" fn close_client(client_ptr: *const c_void) {
 ///
 /// # Safety
 ///
-/// This function should only be called, and should complete
+/// This function should only be called once, and should complete
 /// and call one of the response callbacks before `close_client` is called. After
 /// that the `client_ptr` is not in a valid state.
 #[no_mangle]

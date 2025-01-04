@@ -515,7 +515,7 @@ fn valkey_value_to_command_response(value: Value) -> RedisResult<CommandResponse
 ///
 /// # Safety
 ///
-/// This function should only be called, and should complete and call one of the response callbacks before `close_client` is called.
+/// This function should only be called once, and should complete and call one of the response callbacks before `close_client` is called.
 /// After `close_client` is called, the `client_ptr` is not in a valid state.
 #[no_mangle]
 pub unsafe extern "C" fn command(
