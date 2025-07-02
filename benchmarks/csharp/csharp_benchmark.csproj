@@ -1,7 +1,18 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFrameworks>net8.0;net6.0</TargetFrameworks>
+    <LangVersion>preview</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <Configurations>Debug;Release;Lint</Configurations>
+    <RootNamespace>Valkey.Glide.CustomBenchmark</RootNamespace>
+  </PropertyGroup>
+
   <ItemGroup>
-    <ProjectReference Include="..\..\csharp\lib\glide.csproj" />
+    <ProjectReference Include="$(MSBuildThisFileDirectory)../../csharp/sources/Valkey.Glide/Valkey.Glide.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -10,11 +21,10 @@
     <PackageReference Include="StackExchange.Redis" Version="2.6.48" />
   </ItemGroup>
 
+  <!-- Workaround for https://github.com/dotnet/roslyn/issues/41640 -->
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <TargetFramework>net6.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;CS1573;CS1587</NoWarn>
   </PropertyGroup>
 
 </Project>

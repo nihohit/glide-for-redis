@@ -5,22 +5,26 @@ inputs:
         description: "folder that contains the target Cargo.toml file"
         required: true
         type: string
+    github-token:
+        description: "github token"
+        required: false
+        type: string
 
 runs:
     using: "composite"
-
     steps:
         - uses: actions/checkout@v4
-          with:
-              submodules: recursive
 
-        - uses: dtolnay/rust-toolchain@stable
-        - uses: Swatinem/rust-cache@v2
-
-        - name: Install protoc (protobuf)
-          uses: arduino/setup-protoc@v2.1.0
+        - name: Install Rust toolchain and protoc
+          uses: ./.github/workflows/install-rust-and-protoc
           with:
-            version: "25.1"
+              github-token: ${{ inputs.github-token }}
+
+        - uses: actions/cache@v4
+          with:
+              path: ${{ inputs.cargo-toml-folder }}/target
+              # this action should be used on the most common runner only
+              key: x86_64-unknown-linux-gnu-${{ inputs.cargo-toml-folder }}
 
         - run: cargo fmt --all -- --check
           working-directory: ${{ inputs.cargo-toml-folder }}
@@ -30,9 +34,14 @@ runs:
           working-directory: ${{ inputs.cargo-toml-folder }}
           shell: bash
 
+          # We run clippy without features
+        - run: cargo clippy --all-targets -- -D warnings
+          working-directory: ${{ inputs.cargo-toml-folder }}
+          shell: bash
+
         - run: |
               cargo update
-              cargo install cargo-deny
+              cargo install --locked cargo-deny
               cargo deny check --config ${GITHUB_WORKSPACE}/deny.toml
           working-directory: ${{ inputs.cargo-toml-folder }}
           shell: bash

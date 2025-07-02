@@ -1,7 +1,9 @@
+# Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
+
 import argparse
-import asyncio
 import functools
 import json
+import math
 import random
 import time
 from datetime import datetime, timezone
@@ -10,15 +12,17 @@ from pathlib import Path
 from statistics import mean
 from typing import List
 
+import anyio
 import numpy as np
 import redis.asyncio as redispy  # type: ignore
 from glide import (
-    BaseClientConfiguration,
+    GlideClient,
+    GlideClientConfiguration,
+    GlideClusterClient,
+    GlideClusterClientConfiguration,
     Logger,
     LogLevel,
     NodeAddress,
-    RedisClient,
-    RedisClusterClient,
 )
 
 
@@ -34,61 +38,79 @@ arguments_parser = argparse.ArgumentParser()
 arguments_parser.add_argument(
     "--resultsFile",
     help="Where to write the results file",
-    required=True,
+    required=False,
+    default="../results/python-results.json",
 )
 arguments_parser.add_argument(
-    "--dataSize",
-    help="Size of data to set",
-    required=True,
+    "--dataSize", help="Size of data to set", required=False, default="100"
 )
 arguments_parser.add_argument(
     "--concurrentTasks",
     help="List of number of concurrent tasks to run",
     nargs="+",
-    required=True,
+    required=False,
+    default=("1", "10", "100", "1000"),
 )
 arguments_parser.add_argument(
-    "--clients",
-    help="Which clients should run",
-    required=True,
+    "--clients", help="Which clients should run", required=False, default="all"
 )
 arguments_parser.add_argument(
-    "--host",
-    help="What host to target",
-    required=True,
+    "--host", help="What host to target", required=False, default="localhost"
 )
 arguments_parser.add_argument(
     "--clientCount",
     help="Number of clients to run concurrently",
     nargs="+",
-    required=True,
+    required=False,
+    default=("1"),
 )
 arguments_parser.add_argument(
-    "--tls", help="Should benchmark a TLS server", action="store_true"
+    "--tls",
+    help="Should benchmark a TLS server",
+    action="store_true",
+    required=False,
+    default=False,
 )
 arguments_parser.add_argument(
     "--clusterModeEnabled",
     help="Should benchmark a cluster mode enabled cluster",
     action="store_true",
+    required=False,
+    default=False,
 )
 arguments_parser.add_argument(
     "--port",
     default=PORT,
     type=int,
+    required=False,
     help="Which port to connect to, defaults to `%(default)s`",
 )
 arguments_parser.add_argument(
     "--minimal", help="Should run a minimal benchmark", action="store_true"
 )
+arguments_parser.add_argument(
+    "--backend",
+    help="Async backend to use",
+    required=False,
+    default="asyncio",
+    choices=["asyncio", "trio"],
+)
 args = arguments_parser.parse_args()
+
+if args.backend == "trio" and args.clients != "glide":
+    raise ValueError("Trio backend is only supported on the 'glide' client")
 
 PROB_GET = 0.8
 PROB_GET_EXISTING_KEY = 0.8
 SIZE_GET_KEYSPACE = 3750000  # 3.75 million
 SIZE_SET_KEYSPACE = 3000000  # 3 million
 started_tasks_counter = 0
-running_tasks = set()
 bench_json_results: List[str] = []
+
+
+def truncate_decimal(number: float, digits: int = 3) -> float:
+    stepper = 10**digits
+    return math.floor(number * stepper) / stepper
 
 
 def generate_value(size):
@@ -150,8 +172,8 @@ async def execute_commands(clients, total_commands, data_size, action_latencies)
         elif chosen_action == ChosenAction.SET:
             await client.set(generate_key_set(), generate_value(data_size))
         toc = time.perf_counter()
-        execution_time = toc - tic
-        action_latencies[chosen_action].append(execution_time)
+        execution_time_milli = (toc - tic) * 1000
+        action_latencies[chosen_action].append(truncate_decimal(execution_time_milli))
     return True
 
 
@@ -160,16 +182,17 @@ async def create_and_run_concurrent_tasks(
     clients, total_commands, num_of_concurrent_tasks, data_size, action_latencies
 ):
     global started_tasks_counter
-    global get_latency
-    global set_latency
     started_tasks_counter = 0
-    for _ in range(num_of_concurrent_tasks):
-        task = asyncio.create_task(
-            execute_commands(clients, total_commands, data_size, action_latencies)
-        )
-        running_tasks.add(task)
-        task.add_done_callback(running_tasks.discard)
-    await asyncio.gather(*(list(running_tasks)))
+
+    async with anyio.create_task_group() as tg:
+        for _ in range(num_of_concurrent_tasks):
+            tg.start_soon(
+                execute_commands,
+                clients,
+                total_commands,
+                data_size,
+                action_latencies,
+            )
 
 
 def latency_results(prefix, latencies):
@@ -177,8 +200,8 @@ def latency_results(prefix, latencies):
     result[prefix + "_p50_latency"] = calculate_latency(latencies, 50)
     result[prefix + "_p90_latency"] = calculate_latency(latencies, 90)
     result[prefix + "_p99_latency"] = calculate_latency(latencies, 9)
-    result[prefix + "_average_latency"] = mean(latencies)
-    result[prefix + "_std_dev"] = np.std(latencies)
+    result[prefix + "_average_latency"] = truncate_decimal(mean(latencies))
+    result[prefix + "_std_dev"] = truncate_decimal(np.std(latencies))
 
     return result
 
@@ -276,9 +299,15 @@ async def main(
 
     if clients_to_run == "all" or clients_to_run == "glide":
         # Glide Socket
-        client_class = RedisClusterClient if is_cluster else RedisClient
-        config = BaseClientConfiguration(
-            [NodeAddress(host=host, port=port)], use_tls=use_tls
+        client_class = GlideClusterClient if is_cluster else GlideClient
+        config = (
+            GlideClusterClientConfiguration(
+                [NodeAddress(host=host, port=port)], use_tls=use_tls
+            )
+            if is_cluster
+            else GlideClientConfiguration(
+                [NodeAddress(host=host, port=port)], use_tls=use_tls
+            )
         )
         clients = await create_clients(
             client_count,
@@ -324,18 +353,18 @@ if __name__ == "__main__":
         iterations = (
             1000 if args.minimal else number_of_iterations(num_of_concurrent_tasks)
         )
-        asyncio.run(
-            main(
-                "asyncio",
-                iterations,
-                num_of_concurrent_tasks,
-                data_size,
-                clients_to_run,
-                host,
-                number_of_clients,
-                use_tls,
-                is_cluster,
-            )
+        anyio.run(
+            main,
+            args.backend,
+            iterations,
+            num_of_concurrent_tasks,
+            data_size,
+            clients_to_run,
+            host,
+            number_of_clients,
+            use_tls,
+            is_cluster,
+            backend=args.backend,
         )
 
     process_results()

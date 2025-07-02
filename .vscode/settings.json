@@ -2,7 +2,10 @@
     "editor.insertSpaces": true,
     "editor.tabSize": 4,
     "editor.codeActionsOnSave": {
-        "source.organizeImports": true
+        "source.organizeImports": "always"
+    },
+    "rust-analyzer.procMacro.ignored": {
+        "napi-derive": ["napi"]
     },
     "editor.formatOnSave": true,
     "files.insertFinalNewline": true,
@@ -13,10 +16,11 @@
         "python/Cargo.toml",
         "node/rust-client/Cargo.toml",
         "logger_core/Cargo.toml",
-        "csharp/lib/Cargo.toml",
-        "submodules/redis-rs/Cargo.toml",
+        "csharp/rust/Cargo.toml",
+        "glide-core/redis-rs/Cargo.toml",
         "benchmarks/rust/Cargo.toml",
-        "java/Cargo.toml"
+        "java/Cargo.toml",
+        "ffi/Cargo.toml",
     ],
     "rust-analyzer.runnableEnv": {
         "REDISRS_SERVER_TYPE": "tcp"
@@ -27,7 +31,7 @@
     "python.testing.unittestEnabled": false,
     "python.testing.pytestEnabled": true,
     "[github-actions-workflow]": {
-        "editor.defaultFormatter": "redhat.vscode-yaml"
+        "editor.defaultFormatter": "esbenp.prettier-vscode"
     },
     "yaml.schemas": {
         "https://json.schemastore.org/github-workflow.json": [
@@ -57,5 +61,15 @@
         "--profile",
         "black"
     ],
-    "rust-analyzer.cargo.features": "all"
+    "rust-analyzer.cargo.features": "all",
+    "rust-analyzer.procMacro.enable": true,
+    "rust-analyzer.cargo.buildScripts.enable": true,
+    "dotnet.defaultSolution": "csharp/csharp.sln",
+    "java.compile.nullAnalysis.mode": "automatic",
+    "java.configuration.updateBuildConfiguration": "interactive",
+    "files.associations": {
+        "**/frontmatter.json": "jsonc",
+        "**/.frontmatter/config/*.json": "jsonc",
+        "iosfwd": "cpp"
+    }
 }

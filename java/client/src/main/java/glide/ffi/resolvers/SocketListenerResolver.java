@@ -1,3 +1,4 @@
+/** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.ffi.resolvers;
 
 public class SocketListenerResolver {
@@ -7,7 +8,7 @@ public class SocketListenerResolver {
 
     // TODO: consider lazy loading the glide_rs library
     static {
-        System.loadLibrary("glide_rs");
+        NativeUtils.loadGlideLib();
     }
 
     /**

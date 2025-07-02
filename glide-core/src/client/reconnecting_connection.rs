@@ -1,24 +1,45 @@
-use crate::connection_request::{NodeAddress, TlsMode};
-use crate::retry_strategies::RetryStrategy;
+// Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
+
+use super::{NodeAddress, TlsMode};
+use async_trait::async_trait;
 use futures_intrusive::sync::ManualResetEvent;
-use logger_core::{log_debug, log_trace, log_warn};
-use redis::aio::MultiplexedConnection;
-use redis::{RedisConnectionInfo, RedisError, RedisResult};
-use std::sync::atomic::{AtomicBool, Ordering};
+use logger_core::{log_debug, log_error, log_trace, log_warn};
+use redis::aio::{DisconnectNotifier, MultiplexedConnection};
+use redis::{
+    GlideConnectionOptions, PushInfo, RedisConnectionInfo, RedisError, RedisResult, RetryStrategy,
+};
+use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{RwLock, RwLockReadGuard};
 use std::time::Duration;
+use telemetrylib::Telemetry;
+use tokio::sync::{Notify, mpsc};
 use tokio::task;
-use tokio_retry::Retry;
+use tokio::time::timeout;
+use tokio_retry2::{Retry, RetryError};
 
-use super::{run_with_timeout, DEFAULT_CONNECTION_ATTEMPT_TIMEOUT};
+use super::{DEFAULT_CONNECTION_TIMEOUT, run_with_timeout};
+
+const WRITE_LOCK_ERR: &str = "Failed to acquire the write lock";
+const READ_LOCK_ERR: &str = "Failed to acquire the read lock";
+
+/// The reason behind the call to `reconnect()`
+#[derive(PartialEq, Eq, Debug, Clone)]
+pub enum ReconnectReason {
+    /// A connection was dropped (for any reason)
+    ConnectionDropped,
+    /// Connection creation error
+    CreateError,
+}
 
 /// The object that is used in order to recreate a connection after a disconnect.
 struct ConnectionBackend {
     /// This signal is reset when a connection disconnects, and set when a new `ConnectionState` has been set with a `Connected` state.
     connection_available_signal: ManualResetEvent,
     /// Information needed in order to create a new connection.
-    connection_info: redis::Client,
+    connection_info: RwLock<redis::Client>,
     /// Once this flag is set, the internal connection needs no longer try to reconnect to the server, because all the outer clients were dropped.
     client_dropped_flagged: AtomicBool,
 }
@@ -41,40 +62,111 @@ struct InnerReconnectingConnection {
 #[derive(Clone)]
 pub(super) struct ReconnectingConnection {
     inner: Arc<InnerReconnectingConnection>,
+    connection_options: GlideConnectionOptions,
 }
 
-async fn get_multiplexed_connection(client: &redis::Client) -> RedisResult<MultiplexedConnection> {
+impl fmt::Debug for ReconnectingConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.node_address())
+    }
+}
+
+async fn get_multiplexed_connection(
+    client: &redis::Client,
+    connection_options: &GlideConnectionOptions,
+) -> RedisResult<MultiplexedConnection> {
     run_with_timeout(
-        DEFAULT_CONNECTION_ATTEMPT_TIMEOUT,
-        client.get_multiplexed_async_connection(),
+        Some(
+            connection_options
+                .connection_timeout
+                .unwrap_or(DEFAULT_CONNECTION_TIMEOUT),
+        ),
+        client.get_multiplexed_async_connection(connection_options.clone()),
     )
     .await
+}
+
+#[derive(Clone)]
+struct TokioDisconnectNotifier {
+    disconnect_notifier: Arc<Notify>,
+}
+
+#[async_trait]
+impl DisconnectNotifier for TokioDisconnectNotifier {
+    fn notify_disconnect(&mut self) {
+        self.disconnect_notifier.notify_one();
+    }
+
+    async fn wait_for_disconnect_with_timeout(&self, max_wait: &Duration) {
+        let _ = timeout(*max_wait, async {
+            self.disconnect_notifier.notified().await;
+        })
+        .await;
+    }
+
+    fn clone_box(&self) -> Box<dyn DisconnectNotifier> {
+        Box::new(self.clone())
+    }
+}
+
+impl TokioDisconnectNotifier {
+    fn new() -> TokioDisconnectNotifier {
+        TokioDisconnectNotifier {
+            disconnect_notifier: Arc::new(Notify::new()),
+        }
+    }
 }
 
 async fn create_connection(
     connection_backend: ConnectionBackend,
     retry_strategy: RetryStrategy,
+    push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+    discover_az: bool,
+    connection_timeout: Duration,
 ) -> Result<ReconnectingConnection, (ReconnectingConnection, RedisError)> {
-    let client = &connection_backend.connection_info;
-    let action = || get_multiplexed_connection(client);
+    let client = {
+        let guard = connection_backend
+            .connection_info
+            .read()
+            .expect(READ_LOCK_ERR);
+        guard.clone()
+    };
 
-    match Retry::spawn(retry_strategy.get_iterator(), action).await {
+    let connection_options = GlideConnectionOptions {
+        push_sender,
+        disconnect_notifier: Some::<Box<dyn DisconnectNotifier>>(Box::new(
+            TokioDisconnectNotifier::new(),
+        )),
+        discover_az,
+        connection_timeout: Some(connection_timeout),
+        connection_retry_strategy: Some(retry_strategy),
+    };
+
+    let action = || async {
+        get_multiplexed_connection(&client, &connection_options)
+            .await
+            .map_err(RetryError::transient)
+    };
+
+    match Retry::spawn(retry_strategy.get_bounded_backoff_dur_iterator(), action).await {
         Ok(connection) => {
             log_debug(
                 "connection creation",
                 format!(
                     "Connection to {} created",
                     connection_backend
-                        .connection_info
+                        .get_backend_client()
                         .get_connection_info()
                         .addr
                 ),
             );
+            Telemetry::incr_total_connections(1);
             Ok(ReconnectingConnection {
                 inner: Arc::new(InnerReconnectingConnection {
                     state: Mutex::new(ConnectionState::Connected(connection)),
                     backend: connection_backend,
                 }),
+                connection_options,
             })
         }
         Err(err) => {
@@ -83,7 +175,7 @@ async fn create_connection(
                 format!(
                     "Failed connecting to {}, due to {err}",
                     connection_backend
-                        .connection_info
+                        .get_backend_client()
                         .get_connection_info()
                         .addr
                 ),
@@ -93,8 +185,9 @@ async fn create_connection(
                     state: Mutex::new(ConnectionState::InitializedDisconnected),
                     backend: connection_backend,
                 }),
+                connection_options,
             };
-            connection.reconnect();
+            connection.reconnect(ReconnectReason::CreateError);
             Err((connection, err))
         }
     }
@@ -113,16 +206,11 @@ fn get_client(
     .unwrap() // can unwrap, because [open] fails only on trying to convert input to ConnectionInfo, and we pass ConnectionInfo.
 }
 
-/// This iterator isn't exposed to users, and can't be configured.
-fn internal_retry_iterator() -> impl Iterator<Item = Duration> {
-    const MAX_DURATION: Duration = Duration::from_secs(5);
-    crate::retry_strategies::get_exponential_backoff(
-        crate::retry_strategies::EXPONENT_BASE,
-        crate::retry_strategies::FACTOR,
-        crate::retry_strategies::NUMBER_OF_RETRIES,
-    )
-    .get_iterator()
-    .chain(std::iter::repeat(MAX_DURATION))
+impl ConnectionBackend {
+    /// Returns a read-only reference to the client's connection information
+    fn get_backend_client(&self) -> RwLockReadGuard<'_, redis::Client> {
+        self.connection_info.read().expect(READ_LOCK_ERR)
+    }
 }
 
 impl ReconnectingConnection {
@@ -131,6 +219,9 @@ impl ReconnectingConnection {
         connection_retry_strategy: RetryStrategy,
         redis_connection_info: RedisConnectionInfo,
         tls_mode: TlsMode,
+        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        discover_az: bool,
+        connection_timeout: Duration,
     ) -> Result<ReconnectingConnection, (ReconnectingConnection, RedisError)> {
         log_debug(
             "connection creation",
@@ -139,11 +230,27 @@ impl ReconnectingConnection {
 
         let connection_info = get_client(address, tls_mode, redis_connection_info);
         let backend = ConnectionBackend {
-            connection_info,
+            connection_info: RwLock::new(connection_info),
             connection_available_signal: ManualResetEvent::new(true),
             client_dropped_flagged: AtomicBool::new(false),
         };
-        create_connection(backend, connection_retry_strategy).await
+        create_connection(
+            backend,
+            connection_retry_strategy,
+            push_sender,
+            discover_az,
+            connection_timeout,
+        )
+        .await
+    }
+
+    pub(crate) fn node_address(&self) -> String {
+        self.inner
+            .backend
+            .get_backend_client()
+            .get_connection_info()
+            .addr
+            .to_string()
     }
 
     pub(super) fn is_dropped(&self) -> bool {
@@ -154,6 +261,9 @@ impl ReconnectingConnection {
     }
 
     pub(super) fn mark_as_dropped(&self) {
+        // Update the telemetry for each connection that is dropped. A dropped connection
+        // will not be re-connected, so update the telemetry here
+        Telemetry::decr_total_connections(1);
         self.inner
             .backend
             .client_dropped_flagged
@@ -178,7 +288,10 @@ impl ReconnectingConnection {
         }
     }
 
-    pub(super) fn reconnect(&self) {
+    /// Attempt to re-connect the connection.
+    ///
+    /// This function spawns a task to perform the reconnection in the background
+    pub(super) fn reconnect(&self, reason: ReconnectReason) {
         {
             let mut guard = self.inner.state.lock().unwrap();
             if matches!(*guard, ConnectionState::Reconnecting) {
@@ -192,11 +305,27 @@ impl ReconnectingConnection {
         log_debug("reconnect", "starting");
 
         let connection_clone = self.clone();
+
+        if reason.eq(&ReconnectReason::ConnectionDropped) {
+            // Attempting to reconnect a connection that was dropped (for any reason) - update the telemetry by reducing
+            // the number of opened connections by 1, it will be incremented by 1 after a successful re-connect
+            Telemetry::decr_total_connections(1);
+        }
+
         // The reconnect task is spawned instead of awaited here, so that the reconnect attempt will continue in the
         // background, regardless of whether the calling task is dropped or not.
         task::spawn(async move {
-            let client = &connection_clone.inner.backend.connection_info;
-            for sleep_duration in internal_retry_iterator() {
+            let client = {
+                let guard = connection_clone.inner.backend.get_backend_client();
+                guard.clone()
+            };
+
+            let infinite_backoff_dur_iterator = connection_clone
+                .connection_options
+                .connection_retry_strategy
+                .unwrap()
+                .get_infinite_backoff_dur_iterator();
+            for sleep_duration in infinite_backoff_dur_iterator {
                 if connection_clone.is_dropped() {
                     log_debug(
                         "ReconnectingConnection",
@@ -205,7 +334,9 @@ impl ReconnectingConnection {
                     // Client was dropped, reconnection attempts can stop
                     return;
                 }
-                match get_multiplexed_connection(client).await {
+                match get_multiplexed_connection(&client, &connection_clone.connection_options)
+                    .await
+                {
                     Ok(mut connection) => {
                         if connection
                             .send_packed_command(&redis::cmd("PING"))
@@ -217,7 +348,7 @@ impl ReconnectingConnection {
                         }
                         {
                             let mut guard = connection_clone.inner.state.lock().unwrap();
-                            log_debug("reconnect", "completed succesfully");
+                            log_debug("reconnect", "completed successfully");
                             connection_clone
                                 .inner
                                 .backend
@@ -225,6 +356,7 @@ impl ReconnectingConnection {
                                 .set();
                             *guard = ConnectionState::Connected(connection);
                         }
+                        Telemetry::incr_total_connections(1);
                         return;
                     }
                     Err(_) => tokio::time::sleep(sleep_duration).await,
@@ -238,5 +370,33 @@ impl ReconnectingConnection {
             *self.inner.state.lock().unwrap(),
             ConnectionState::Reconnecting
         )
+    }
+
+    pub async fn wait_for_disconnect_with_timeout(&self, max_wait: &Duration) {
+        // disconnect_notifier should always exists
+        if let Some(disconnect_notifier) = &self.connection_options.disconnect_notifier {
+            disconnect_notifier
+                .wait_for_disconnect_with_timeout(max_wait)
+                .await;
+        } else {
+            log_error("disconnect notifier", "BUG! Disconnect notifier is not set");
+        }
+    }
+
+    /// Updates the password that's saved inside connection_info, that will be used in case of disconnection from the server.
+    pub(crate) fn update_connection_password(&self, new_password: Option<String>) {
+        let mut client = self
+            .inner
+            .backend
+            .connection_info
+            .write()
+            .expect(WRITE_LOCK_ERR);
+        client.update_password(new_password);
+    }
+
+    /// Returns the username if one was configured during client creation. Otherwise, returns None.
+    pub(crate) fn get_username(&self) -> Option<String> {
+        let client = self.inner.backend.get_backend_client();
+        client.get_connection_info().redis.username.clone()
     }
 }

@@ -1,19 +1,18 @@
+/** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.connectors.handlers;
 
+import command_request.CommandRequestOuterClass.CommandRequest;
 import connection_request.ConnectionRequestOuterClass.ConnectionRequest;
-import glide.connectors.resources.Platform;
-import glide.connectors.resources.ThreadPoolAllocator;
+import glide.connectors.resources.ThreadPoolResource;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelInitializer;
-import io.netty.channel.EventLoopGroup;
+import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.unix.DomainSocketAddress;
-import io.netty.channel.unix.DomainSocketChannel;
-import io.netty.channel.unix.UnixChannel;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import redis_request.RedisRequestOuterClass.RedisRequest;
+import java.util.concurrent.atomic.AtomicBoolean;
+import lombok.NonNull;
+import lombok.RequiredArgsConstructor;
 import response.ResponseOuterClass.Response;
 
 /**
@@ -22,43 +21,36 @@ import response.ResponseOuterClass.Response;
  */
 public class ChannelHandler {
 
-    private static final String THREAD_POOL_NAME = "glide-channel";
+    protected final Channel channel;
+    protected final CallbackDispatcher callbackDispatcher;
+    private AtomicBoolean isClosed = new AtomicBoolean(false);
 
-    private final Channel channel;
-    private final CallbackDispatcher callbackDispatcher;
-
-    /** Open a new channel for a new client. */
-    public ChannelHandler(CallbackDispatcher callbackDispatcher, String socketPath) {
-        this(
-                ThreadPoolAllocator.createOrGetNettyThreadPool(THREAD_POOL_NAME, Optional.empty()),
-                Platform.getClientUdsNettyChannelType(),
-                new ProtobufSocketChannelInitializer(callbackDispatcher),
-                new DomainSocketAddress(socketPath),
-                callbackDispatcher);
+    public boolean isClosed() {
+        return this.isClosed.get() || !this.channel.isOpen();
     }
 
     /**
-     * Open a new channel for a new client and running it on the provided EventLoopGroup
+     * Open a new channel for a new client and running it on the provided EventLoopGroup.
      *
-     * @param eventLoopGroup - ELG to run handler on
-     * @param domainSocketChannelClass - socket channel class for Handler
-     * @param channelInitializer - UnixChannel initializer
-     * @param domainSocketAddress - address to connect
-     * @param callbackDispatcher - dispatcher to handle callbacks
+     * @param callbackDispatcher Dispatcher to handle callbacks
+     * @param socketPath Address to connect
+     * @param threadPoolResource Resource to choose ELG and domainSocketChannelClass
      */
     public ChannelHandler(
-            EventLoopGroup eventLoopGroup,
-            Class<? extends DomainSocketChannel> domainSocketChannelClass,
-            ChannelInitializer<UnixChannel> channelInitializer,
-            DomainSocketAddress domainSocketAddress,
-            CallbackDispatcher callbackDispatcher) {
+            CallbackDispatcher callbackDispatcher,
+            String socketPath,
+            ThreadPoolResource threadPoolResource)
+            throws InterruptedException {
+
         channel =
                 new Bootstrap()
-                        .group(eventLoopGroup)
-                        .channel(domainSocketChannelClass)
-                        .handler(channelInitializer)
-                        .connect(domainSocketAddress)
-                        // TODO call here .sync() if needed or remove this comment
+                        .group(threadPoolResource.getEventLoopGroup())
+                        .channel(threadPoolResource.getDomainSocketChannelClass())
+                        .handler(new ProtobufSocketChannelInitializer(callbackDispatcher))
+                        .connect(new DomainSocketAddress(socketPath))
+                        // TODO    .addListener(new NettyFutureErrorHandler())
+                        //   we need to use connection promise here for that ^
+                        .sync()
                         .channel();
         this.callbackDispatcher = callbackDispatcher;
     }
@@ -70,14 +62,16 @@ public class ChannelHandler {
      * @param flush True to flush immediately
      * @return A response promise
      */
-    public CompletableFuture<Response> write(RedisRequest.Builder request, boolean flush) {
+    public CompletableFuture<Response> write(CommandRequest.Builder request, boolean flush) {
         var commandId = callbackDispatcher.registerRequest();
         request.setCallbackIdx(commandId.getKey());
 
         if (flush) {
-            channel.writeAndFlush(request.build());
+            channel
+                    .writeAndFlush(request.build())
+                    .addListener(new NettyFutureErrorHandler(commandId.getValue()));
         } else {
-            channel.write(request.build());
+            channel.write(request.build()).addListener(new NettyFutureErrorHandler(commandId.getValue()));
         }
         return commandId.getValue();
     }
@@ -89,13 +83,36 @@ public class ChannelHandler {
      * @return A connection promise
      */
     public CompletableFuture<Response> connect(ConnectionRequest request) {
-        channel.writeAndFlush(request);
-        return callbackDispatcher.registerConnection();
+        var future = callbackDispatcher.registerConnection();
+        channel.writeAndFlush(request).addListener(new NettyFutureErrorHandler(future));
+        return future;
     }
 
     /** Closes the UDS connection and frees corresponding resources. */
     public ChannelFuture close() {
+        this.isClosed.set(true);
         callbackDispatcher.shutdownGracefully();
         return channel.close();
+    }
+
+    /**
+     * Propagate an error from Netty's {@link ChannelFuture} and complete the {@link
+     * CompletableFuture} promise.
+     */
+    @RequiredArgsConstructor
+    private static class NettyFutureErrorHandler implements ChannelFutureListener {
+
+        private final CompletableFuture<Response> promise;
+
+        @Override
+        public void operationComplete(@NonNull ChannelFuture channelFuture) throws Exception {
+            if (channelFuture.isCancelled()) {
+                promise.cancel(false);
+            }
+            var cause = channelFuture.cause();
+            if (cause != null) {
+                promise.completeExceptionally(cause);
+            }
+        }
     }
 }

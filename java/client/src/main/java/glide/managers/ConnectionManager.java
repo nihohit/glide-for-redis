@@ -1,21 +1,26 @@
+/** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.managers;
 
+import com.google.protobuf.ByteString;
 import connection_request.ConnectionRequestOuterClass;
 import connection_request.ConnectionRequestOuterClass.AuthenticationInfo;
 import connection_request.ConnectionRequestOuterClass.ConnectionRequest;
+import connection_request.ConnectionRequestOuterClass.PubSubChannelsOrPatterns;
+import connection_request.ConnectionRequestOuterClass.PubSubSubscriptions;
 import connection_request.ConnectionRequestOuterClass.TlsMode;
+import glide.api.models.configuration.AdvancedBaseClientConfiguration;
 import glide.api.models.configuration.BaseClientConfiguration;
+import glide.api.models.configuration.GlideClientConfiguration;
+import glide.api.models.configuration.GlideClusterClientConfiguration;
 import glide.api.models.configuration.NodeAddress;
+import glide.api.models.configuration.ProtocolVersion;
 import glide.api.models.configuration.ReadFrom;
-import glide.api.models.configuration.RedisClientConfiguration;
-import glide.api.models.configuration.RedisClusterClientConfiguration;
 import glide.api.models.exceptions.ClosingException;
+import glide.api.models.exceptions.ConfigurationError;
 import glide.connectors.handlers.ChannelHandler;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import lombok.RequiredArgsConstructor;
-import response.ResponseOuterClass.RequestError;
 import response.ResponseOuterClass.Response;
 
 /**
@@ -26,19 +31,37 @@ import response.ResponseOuterClass.Response;
 public class ConnectionManager {
 
     // TODO: consider making connection manager static, and moving the ChannelHandler to the
-    // RedisClient.
+    // GlideClient.
 
     /** UDS connection representation. */
     private final ChannelHandler channel;
 
     /**
-     * Make a connection request to Redis Rust-core client.
+     * Make a connection request to Valkey Rust-core client.
      *
      * @param configuration Connection Request Configuration
      */
-    public CompletableFuture<Void> connectToRedis(BaseClientConfiguration configuration) {
+    public CompletableFuture<Void> connectToValkey(BaseClientConfiguration configuration) {
         ConnectionRequest request = createConnectionRequest(configuration);
-        return channel.connect(request).thenApplyAsync(this::checkGlideRsResponse);
+        return channel
+                .connect(request)
+                .exceptionally(this::exceptionHandler)
+                .thenApplyAsync(this::checkGlideRsResponse);
+    }
+
+    /**
+     * Exception handler for future pipeline.
+     *
+     * @param e An exception thrown in the pipeline before
+     * @return Nothing, it always rethrows the exception
+     */
+    private Response exceptionHandler(Throwable e) {
+        channel.close();
+        if (e instanceof RuntimeException) {
+            // GlideException also goes here
+            throw (RuntimeException) e;
+        }
+        throw new RuntimeException(e);
     }
 
     /**
@@ -49,13 +72,13 @@ public class ConnectionManager {
      * @return ConnectionRequest protobuf message
      */
     private ConnectionRequest createConnectionRequest(BaseClientConfiguration configuration) {
-        if (configuration instanceof RedisClusterClientConfiguration) {
-            return setupConnectionRequestBuilderRedisClusterClient(
-                            (RedisClusterClientConfiguration) configuration)
+        if (configuration instanceof GlideClusterClientConfiguration) {
+            return setupConnectionRequestBuilderGlideClusterClient(
+                            (GlideClusterClientConfiguration) configuration)
                     .build();
         }
 
-        return setupConnectionRequestBuilderRedisClient((RedisClientConfiguration) configuration)
+        return setupConnectionRequestBuilderGlideClient((GlideClientConfiguration) configuration)
                 .build();
     }
 
@@ -94,46 +117,148 @@ public class ConnectionManager {
             connectionRequestBuilder.setRequestTimeout(configuration.getRequestTimeout());
         }
 
+        if (configuration.getClientName() != null) {
+            connectionRequestBuilder.setClientName(configuration.getClientName());
+        }
+
+        if (configuration.getInflightRequestsLimit() != null) {
+            connectionRequestBuilder.setInflightRequestsLimit(configuration.getInflightRequestsLimit());
+        }
+
+        if (configuration.getReadFrom() == ReadFrom.AZ_AFFINITY) {
+            if (configuration.getClientAZ() == null) {
+                throw new ConfigurationError(
+                        "`clientAZ` must be set when read_from is set to `AZ_AFFINITY`");
+            }
+            connectionRequestBuilder.setClientAz(configuration.getClientAZ());
+        }
+
+        if (configuration.getReadFrom() == ReadFrom.AZ_AFFINITY_REPLICAS_AND_PRIMARY) {
+            if (configuration.getClientAZ() == null) {
+                throw new ConfigurationError(
+                        "`clientAZ` must be set when read_from is set to `AZ_AFFINITY_REPLICAS_AND_PRIMARY`");
+            }
+            connectionRequestBuilder.setClientAz(configuration.getClientAZ());
+        }
+
+        if (configuration.getProtocol() != null) {
+            connectionRequestBuilder.setProtocolValue(configuration.getProtocol().ordinal());
+        }
+
+        if (configuration.getReconnectStrategy() != null) {
+            var reconnectionStrategyBuilder =
+                    ConnectionRequestOuterClass.ConnectionRetryStrategy.newBuilder()
+                            .setNumberOfRetries(configuration.getReconnectStrategy().getNumOfRetries())
+                            .setExponentBase(configuration.getReconnectStrategy().getExponentBase())
+                            .setFactor(configuration.getReconnectStrategy().getFactor());
+            if (configuration.getReconnectStrategy().getJitterPercent() != null) {
+                reconnectionStrategyBuilder.setJitterPercent(
+                        configuration.getReconnectStrategy().getJitterPercent());
+            }
+            connectionRequestBuilder.setConnectionRetryStrategy(reconnectionStrategyBuilder.build());
+        }
+
         return connectionRequestBuilder;
     }
 
     /**
-     * Creates ConnectionRequestBuilder, so it has appropriate fields for the Redis Standalone Client.
+     * Creates ConnectionRequestBuilder, so it has appropriate fields for the Standalone Client.
      *
      * @param configuration Connection Request Configuration
      */
-    private ConnectionRequest.Builder setupConnectionRequestBuilderRedisClient(
-            RedisClientConfiguration configuration) {
+    private ConnectionRequest.Builder setupConnectionRequestBuilderGlideClient(
+            GlideClientConfiguration configuration) {
         ConnectionRequest.Builder connectionRequestBuilder =
                 setupConnectionRequestBuilderBaseConfiguration(configuration);
         connectionRequestBuilder.setClusterModeEnabled(false);
-        if (configuration.getReconnectStrategy() != null) {
-            connectionRequestBuilder.setConnectionRetryStrategy(
-                    ConnectionRequestOuterClass.ConnectionRetryStrategy.newBuilder()
-                            .setNumberOfRetries(configuration.getReconnectStrategy().getNumOfRetries())
-                            .setFactor(configuration.getReconnectStrategy().getFactor())
-                            .setExponentBase(configuration.getReconnectStrategy().getExponentBase())
-                            .build());
-        }
 
         if (configuration.getDatabaseId() != null) {
             connectionRequestBuilder.setDatabaseId(configuration.getDatabaseId());
         }
 
+        if (configuration.getSubscriptionConfiguration() != null) {
+            if (configuration.getProtocol() == ProtocolVersion.RESP2) {
+                throw new ConfigurationError(
+                        "PubSub subscriptions require RESP3 protocol, but RESP2 was configured.");
+            }
+            var subscriptionsBuilder = PubSubSubscriptions.newBuilder();
+            for (var entry : configuration.getSubscriptionConfiguration().getSubscriptions().entrySet()) {
+                var channelsBuilder = PubSubChannelsOrPatterns.newBuilder();
+                for (var channel : entry.getValue()) {
+                    channelsBuilder.addChannelsOrPatterns(ByteString.copyFrom(channel.getBytes()));
+                }
+                subscriptionsBuilder.putChannelsOrPatternsByType(
+                        entry.getKey().ordinal(), channelsBuilder.build());
+            }
+            connectionRequestBuilder.setPubsubSubscriptions(subscriptionsBuilder.build());
+        }
+
+        connectionRequestBuilder =
+                setupConnectionRequestBuilderAdvancedBaseConfiguration(
+                        connectionRequestBuilder, configuration.getAdvancedConfiguration());
+
         return connectionRequestBuilder;
     }
 
     /**
-     * Creates ConnectionRequestBuilder, so it has appropriate fields for the Redis Cluster Client.
+     * Configures the {@link ConnectionRequest.Builder} with settings from the provided {@link
+     * AdvancedBaseClientConfiguration}.
+     *
+     * @param connectionRequestBuilder The builder for the {@link ConnectionRequest}.
+     * @param advancedConfiguration The advanced configuration settings.
+     * @return The updated {@link ConnectionRequest.Builder}.
+     */
+    private ConnectionRequest.Builder setupConnectionRequestBuilderAdvancedBaseConfiguration(
+            ConnectionRequest.Builder connectionRequestBuilder,
+            AdvancedBaseClientConfiguration advancedConfiguration) {
+
+        if (advancedConfiguration.getConnectionTimeout() != null) {
+            connectionRequestBuilder.setConnectionTimeout(advancedConfiguration.getConnectionTimeout());
+        }
+
+        if (advancedConfiguration.getTlsAdvancedConfiguration().isUseInsecureTLS()) {
+            if (connectionRequestBuilder.getTlsMode() == TlsMode.NoTls) {
+                throw new ConfigurationError(
+                        "`useInsecureTlS` cannot be enabled when  `useTLS` is disabled.");
+            } else {
+                connectionRequestBuilder.setTlsMode(TlsMode.InsecureTls);
+            }
+        }
+
+        return connectionRequestBuilder;
+    }
+
+    /**
+     * Creates ConnectionRequestBuilder, so it has appropriate fields for the Cluster Client.
      *
      * @param configuration
      */
-    private ConnectionRequestOuterClass.ConnectionRequest.Builder
-            setupConnectionRequestBuilderRedisClusterClient(
-                    RedisClusterClientConfiguration configuration) {
+    private ConnectionRequest.Builder setupConnectionRequestBuilderGlideClusterClient(
+            GlideClusterClientConfiguration configuration) {
         ConnectionRequest.Builder connectionRequestBuilder =
                 setupConnectionRequestBuilderBaseConfiguration(configuration);
         connectionRequestBuilder.setClusterModeEnabled(true);
+
+        if (configuration.getSubscriptionConfiguration() != null) {
+            if (configuration.getProtocol() == ProtocolVersion.RESP2) {
+                throw new ConfigurationError(
+                        "PubSub subscriptions require RESP3 protocol, but RESP2 was configured.");
+            }
+            var subscriptionsBuilder = PubSubSubscriptions.newBuilder();
+            for (var entry : configuration.getSubscriptionConfiguration().getSubscriptions().entrySet()) {
+                var channelsBuilder = PubSubChannelsOrPatterns.newBuilder();
+                for (var channel : entry.getValue()) {
+                    channelsBuilder.addChannelsOrPatterns(ByteString.copyFrom(channel.getBytes()));
+                }
+                subscriptionsBuilder.putChannelsOrPatternsByType(
+                        entry.getKey().ordinal(), channelsBuilder.build());
+            }
+            connectionRequestBuilder.setPubsubSubscriptions(subscriptionsBuilder.build());
+        }
+
+        connectionRequestBuilder =
+                setupConnectionRequestBuilderAdvancedBaseConfiguration(
+                        connectionRequestBuilder, configuration.getAdvancedConfiguration());
 
         return connectionRequestBuilder;
     }
@@ -145,24 +270,29 @@ public class ConnectionManager {
      * @return Protobuf defined ReadFrom enum
      */
     private ConnectionRequestOuterClass.ReadFrom mapReadFromEnum(ReadFrom readFrom) {
-        if (readFrom == ReadFrom.PREFER_REPLICA) {
-            return ConnectionRequestOuterClass.ReadFrom.PreferReplica;
+        switch (readFrom) {
+            case PREFER_REPLICA:
+                return ConnectionRequestOuterClass.ReadFrom.PreferReplica;
+            case AZ_AFFINITY:
+                return ConnectionRequestOuterClass.ReadFrom.AZAffinity;
+            case AZ_AFFINITY_REPLICAS_AND_PRIMARY:
+                return ConnectionRequestOuterClass.ReadFrom.AZAffinityReplicasAndPrimary;
+            default:
+                return ConnectionRequestOuterClass.ReadFrom.Primary;
         }
-
-        return ConnectionRequestOuterClass.ReadFrom.Primary;
     }
 
     /** Check a response received from Glide. */
     private Void checkGlideRsResponse(Response response) {
+        // Note: errors are already handled before in CallbackDispatcher, but we double-check
         if (response.hasRequestError()) {
-            RequestError error = response.getRequestError();
-            throwClosingError("Unexpected request error in response: " + error.getMessage());
+            throwClosingError(
+                    "Unhandled request error in response: " + response.getRequestError().getMessage());
         }
         if (response.hasClosingError()) {
-            // A closing error is thrown when Rust-core is not connected to Redis
-            // We want to close shop and throw a ClosingException
-            throwClosingError(response.getClosingError());
+            throwClosingError("Unhandled closing error in response: " + response.getClosingError());
         }
+
         if (response.hasRespPointer()) {
             throwClosingError("Unexpected data in response");
         }
@@ -173,12 +303,8 @@ public class ConnectionManager {
         return null;
     }
 
-    private void throwClosingError(String msg) throws ClosingException {
-        try {
-            closeConnection().get();
-        } catch (InterruptedException | ExecutionException exception) {
-            throw new RuntimeException(exception);
-        }
+    private void throwClosingError(String msg) {
+        closeConnection();
         throw new ClosingException(msg);
     }
 
@@ -188,6 +314,6 @@ public class ConnectionManager {
      * @return a CompletableFuture to indicate the channel is closed
      */
     public Future<Void> closeConnection() {
-        return channel.close().syncUninterruptibly();
+        return channel.close();
     }
 }

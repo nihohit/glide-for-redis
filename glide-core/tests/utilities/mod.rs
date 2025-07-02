@@ -1,3 +1,5 @@
+// Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
+
 #![allow(dead_code)]
 use futures::Future;
 use glide_core::{
@@ -5,10 +7,10 @@ use glide_core::{
     connection_request::{self, AuthenticationInfo, NodeAddress, ProtocolVersion},
 };
 use once_cell::sync::Lazy;
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{Rng, distributions::Alphanumeric};
 use redis::{
+    ConnectionAddr, GlideConnectionOptions, PushInfo, RedisConnectionInfo, RedisResult, Value,
     cluster_routing::{MultipleNodeRoutingInfo, RoutingInfo},
-    ConnectionAddr, RedisConnectionInfo, RedisResult, Value,
 };
 use socket2::{Domain, Socket, Type};
 use std::{
@@ -16,6 +18,7 @@ use std::{
     sync::Mutex, time::Duration,
 };
 use tempfile::TempDir;
+use tokio::sync::mpsc;
 
 pub mod cluster;
 pub mod mocks;
@@ -188,7 +191,7 @@ impl RedisServer {
                 // prepare redis with TLS
                 redis_cmd
                     .arg("--tls-port")
-                    .arg(&port.to_string())
+                    .arg(port.to_string())
                     .arg("--port")
                     .arg("0")
                     .arg("--tls-cert-file")
@@ -256,7 +259,7 @@ impl Drop for RedisServer {
     }
 }
 
-fn encode_iter<W>(values: &Vec<Value>, writer: &mut W, prefix: &str) -> io::Result<()>
+fn encode_iter<W>(values: &[Value], writer: &mut W, prefix: &str) -> io::Result<()>
 where
     W: io::Write,
 {
@@ -267,7 +270,7 @@ where
     Ok(())
 }
 
-fn encode_map<W>(values: &Vec<(Value, Value)>, writer: &mut W, prefix: &str) -> io::Result<()>
+fn encode_map<W>(values: &[(Value, Value)], writer: &mut W, prefix: &str) -> io::Result<()>
 where
     W: io::Write,
 {
@@ -305,7 +308,7 @@ where
             Ok(())
         }
         Value::Set(ref values) => encode_iter(values, writer, "~"),
-        Value::Double(val) => write!(writer, ",{}\r\n", val),
+        Value::Double(val) => write!(writer, ",{val}\r\n"),
         Value::Boolean(v) => {
             if v {
                 write!(writer, "#t\r\n")
@@ -320,7 +323,7 @@ where
             // format is always 3 bytes
             write!(writer, "={}\r\n{}:{}\r\n", 3 + text.len(), format, text)
         }
-        Value::BigNumber(ref val) => write!(writer, "({}\r\n", val),
+        Value::BigNumber(ref val) => write!(writer, "({val}\r\n"),
         Value::Push { ref kind, ref data } => {
             write!(writer, ">{}\r\n+{kind}\r\n", data.len() + 1)?;
             for val in data.iter() {
@@ -328,6 +331,7 @@ where
             }
             Ok(())
         }
+        Value::ServerError(ref err) => write!(writer, "server-error({err})\r\n"),
     }
 }
 
@@ -353,7 +357,7 @@ pub fn build_keys_and_certs_for_tls(tempdir: &TempDir) -> TlsFilePaths {
             .arg("genrsa")
             .arg("-out")
             .arg(name)
-            .arg(&format!("{size}"))
+            .arg(format!("{size}"))
             .stdout(process::Stdio::null())
             .stderr(process::Stdio::null())
             .spawn()
@@ -452,7 +456,10 @@ pub async fn wait_for_server_to_become_ready(server_address: &ConnectionAddr) {
     })
     .unwrap();
     loop {
-        match client.get_multiplexed_async_connection().await {
+        match client
+            .get_multiplexed_async_connection(GlideConnectionOptions::default())
+            .await
+        {
             Err(err) => {
                 if err.is_connection_refusal() {
                     tokio::time::sleep(millisecond).await;
@@ -542,6 +549,7 @@ pub async fn send_set_and_get(mut client: Client, key: String) {
 pub struct TestBasics {
     pub server: Option<RedisServer>,
     pub client: StandaloneClient,
+    pub push_receiver: mpsc::UnboundedReceiver<PushInfo>,
 }
 
 fn convert_to_protobuf_protocol(
@@ -587,8 +595,13 @@ pub async fn setup_acl(addr: &ConnectionAddr, connection_info: &RedisConnectionI
         redis: RedisConnectionInfo::default(),
     })
     .unwrap();
-    let mut connection =
-        repeat_try_create(|| async { client.get_multiplexed_async_connection().await.ok() }).await;
+    let mut connection = repeat_try_create(|| async {
+        client
+            .get_multiplexed_async_connection(GlideConnectionOptions::default())
+            .await
+            .ok()
+    })
+    .await;
 
     let password = connection_info.password.clone().unwrap();
     let username = connection_info
@@ -605,7 +618,7 @@ pub async fn setup_acl(addr: &ConnectionAddr, connection_info: &RedisConnectionI
     connection.send_packed_command(&cmd).await.unwrap();
 }
 
-#[derive(Eq, PartialEq, Default)]
+#[derive(Eq, PartialEq, Default, Clone)]
 pub enum ClusterMode {
     #[default]
     Disabled,
@@ -645,10 +658,15 @@ pub fn create_connection_request(
         connection_request.client_name = client_name.deref().into();
     }
 
+    if let Some(client_az) = &configuration.client_az {
+        connection_request.client_az = client_az.deref().into();
+    }
+    connection_request.lazy_connect = configuration.lazy_connect;
+
     connection_request
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TestConfiguration {
     pub use_tls: bool,
     pub connection_retry_strategy: Option<connection_request::ConnectionRetryStrategy>,
@@ -659,7 +677,9 @@ pub struct TestConfiguration {
     pub read_from: Option<connection_request::ReadFrom>,
     pub database_id: u32,
     pub client_name: Option<String>,
+    pub client_az: Option<String>,
     pub protocol: ProtocolVersion,
+    pub lazy_connect: bool,
 }
 
 pub(crate) async fn setup_test_basics_internal(configuration: &TestConfiguration) -> TestBasics {
@@ -685,11 +705,16 @@ pub(crate) async fn setup_test_basics_internal(configuration: &TestConfiguration
     let mut connection_request = create_connection_request(&[connection_addr], configuration);
     connection_request.cluster_mode_enabled = false;
     connection_request.protocol = configuration.protocol.into();
-    let client = StandaloneClient::create_client(connection_request)
+    let (push_sender, push_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let client = StandaloneClient::create_client(connection_request.into(), Some(push_sender))
         .await
         .unwrap();
 
-    TestBasics { server, client }
+    TestBasics {
+        server,
+        client,
+        push_receiver,
+    }
 }
 
 pub async fn setup_test_basics(use_tls: bool) -> TestBasics {
@@ -704,6 +729,11 @@ pub async fn setup_test_basics(use_tls: bool) -> TestBasics {
 #[ctor::ctor]
 fn init() {
     logger_core::init(Some(logger_core::Level::Debug), None);
+
+    // This needs to be done before any TLS connections are made
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
 }
 
 pub async fn kill_connection(client: &mut impl glide_core::client::GlideClientForTests) {
@@ -715,9 +745,22 @@ pub async fn kill_connection(client: &mut impl glide_core::client::GlideClientFo
             &client_kill_cmd,
             Some(RoutingInfo::MultiNode((
                 MultipleNodeRoutingInfo::AllNodes,
-                None,
+                Some(redis::cluster_routing::ResponsePolicy::AllSucceeded),
             ))),
         )
+        .await
+        .unwrap();
+}
+
+pub async fn kill_connection_for_route(
+    client: &mut impl glide_core::client::GlideClientForTests,
+    route: RoutingInfo,
+) {
+    let mut client_kill_cmd = redis::cmd("CLIENT");
+    client_kill_cmd.arg("KILL").arg("SKIPME").arg("NO");
+
+    let _ = client
+        .send_command(&client_kill_cmd, Some(route))
         .await
         .unwrap();
 }

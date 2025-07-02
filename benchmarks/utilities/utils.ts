@@ -1,3 +1,7 @@
+/**
+ * Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
+ */
+
 import commandLineArgs from "command-line-args";
 import {
     RedisClientType,
@@ -20,7 +24,7 @@ export function createRedisClient(
     host: string,
     isCluster: boolean,
     tls: boolean,
-    port: number
+    port: number,
 ): RedisClusterType | RedisClientType {
     return isCluster
         ? createCluster({
@@ -38,12 +42,21 @@ export function createRedisClient(
 }
 
 const optionDefinitions = [
-    { name: "resultsFile", type: String },
-    { name: "dataSize", type: String },
-    { name: "concurrentTasks", type: String, multiple: true },
-    { name: "clients", type: String },
-    { name: "host", type: String },
-    { name: "clientCount", type: String, multiple: true },
+    {
+        name: "resultsFile",
+        type: String,
+        defaultValue: "../results/node-results.json",
+    },
+    { name: "dataSize", type: String, defaultValue: "100" },
+    {
+        name: "concurrentTasks",
+        type: String,
+        multiple: true,
+        defaultValue: ["1", "10", "100", "1000"],
+    },
+    { name: "clients", type: String, defaultValue: "all" },
+    { name: "host", type: String, defaultValue: "localhost" },
+    { name: "clientCount", type: String, multiple: true, defaultValue: ["1"] },
     { name: "tls", type: Boolean, defaultValue: false },
     { name: "minimal", type: Boolean, defaultValue: false },
     { name: "clusterModeEnabled", type: Boolean, defaultValue: false },
@@ -52,15 +65,15 @@ const optionDefinitions = [
 
 export const receivedOptions = commandLineArgs(optionDefinitions);
 
-export function generate_value(size: number): string {
+export function generateValue(size: number): string {
     return "0".repeat(size);
 }
 
-export function generate_key_set(): string {
+export function generateKeySet(): string {
     return (Math.floor(Math.random() * SIZE_SET_KEYSPACE) + 1).toString();
 }
 
-export function generate_key_get(): string {
+export function generateKeyGet(): string {
     const range = SIZE_GET_KEYSPACE - SIZE_SET_KEYSPACE;
     return Math.floor(Math.random() * range + SIZE_SET_KEYSPACE + 1).toString();
 }

@@ -1,5 +1,9 @@
+/**
+ * Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
+ */
+
 /// Base class for errors.
-export abstract class RedisError extends Error {
+export abstract class ValkeyError extends Error {
     public message: string;
 
     constructor(message?: string) {
@@ -13,10 +17,10 @@ export abstract class RedisError extends Error {
 }
 
 /// Errors that report that the client has closed and is no longer usable.
-export class ClosingError extends RedisError {}
+export class ClosingError extends ValkeyError {}
 
 /// Errors that were reported during a request.
-export class RequestError extends RedisError {}
+export class RequestError extends ValkeyError {}
 
 /// Errors that are thrown when a request times out.
 export class TimeoutError extends RequestError {}
@@ -28,3 +32,6 @@ export class ExecAbortError extends RequestError {}
 
 /// Errors that are thrown when a connection disconnects. These errors can be temporary, as the client will attempt to reconnect.
 export class ConnectionError extends RequestError {}
+
+/// Errors that are thrown when a request cannot be completed in current configuration settings.
+export class ConfigurationError extends RequestError {}

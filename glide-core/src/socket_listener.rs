@@ -1,62 +1,63 @@
+// Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
+
 use super::rotating_buffer::RotatingBuffer;
 use crate::client::Client;
-use crate::connection_request::ConnectionRequest;
-use crate::redis_request::{
-    command, redis_request, Command, RedisRequest, RequestType, Routes, ScriptInvocation,
-    SlotTypes, Transaction,
+use crate::client::get_or_init_runtime;
+use crate::cluster_scan_container::get_cluster_scan_cursor;
+use crate::command_request::{
+    Batch, ClusterScan, Command, CommandRequest, Routes, SlotTypes, command, command_request,
 };
+use crate::connection_request::ConnectionRequest;
+use crate::errors::{RequestErrorType, error_message, error_type};
 use crate::response;
 use crate::response::Response;
-use crate::retry_strategies::get_fixed_interval_backoff;
+use ClosingReason::*;
+use PipeListeningResult::*;
+use bytes::Bytes;
 use directories::BaseDirs;
-use dispose::{Disposable, Dispose};
-use futures::stream::StreamExt;
 use logger_core::{log_debug, log_error, log_info, log_trace, log_warn};
-use protobuf::Message;
+use once_cell::sync::Lazy;
+use protobuf::{Chars, Message};
 use redis::cluster_routing::{
     MultipleNodeRoutingInfo, Route, RoutingInfo, SingleNodeRoutingInfo, SlotAddr,
 };
 use redis::cluster_routing::{ResponsePolicy, Routable};
-use redis::RedisError;
-use redis::{cmd, Cmd, Value};
-use signal_hook::consts::signal::*;
-use signal_hook_tokio::Signals;
+use redis::{
+    ClusterScanArgs, Cmd, PipelineRetryStrategy, PushInfo, RedisError, ScanStateRC, Value,
+};
 use std::cell::Cell;
+use std::collections::HashSet;
+use std::fs;
+use std::io;
+use std::os::unix::fs::PermissionsExt;
+use std::ptr::from_mut;
 use std::rc::Rc;
-use std::{env, str};
-use std::{io, thread};
+use std::str;
+use std::sync::{Arc, RwLock};
+use telemetrylib::{GlideSpan, GlideSpanStatus};
 use thiserror::Error;
-use tokio::io::ErrorKind::AddrInUse;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::runtime::Builder;
-use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::{Sender, channel};
 use tokio::task;
-use tokio_retry::Retry;
 use tokio_util::task::LocalPoolHandle;
-use ClosingReason::*;
-use PipeListeningResult::*;
+use uuid::Uuid;
 
 /// The socket file name
 const SOCKET_FILE_NAME: &str = "glide-socket";
+const UNIX_SOCKER_DIR: &str = "/tmp";
 
 /// The maximum length of a request's arguments to be passed as a vector of
 /// strings instead of a pointer
 pub const MAX_REQUEST_ARGS_LENGTH: usize = 2_i32.pow(12) as usize; // TODO: find the right number
 
-/// struct containing all objects needed to bind to a socket and clean it.
-struct SocketListener {
-    socket_path: String,
-    cleanup_socket: bool,
-}
-
-impl Dispose for SocketListener {
-    fn dispose(self) {
-        if self.cleanup_socket {
-            close_socket(&self.socket_path);
-        }
-    }
-}
+pub const STRING: &str = "string";
+pub const LIST: &str = "list";
+pub const SET: &str = "set";
+pub const ZSET: &str = "zset";
+pub const HASH: &str = "hash";
+pub const STREAM: &str = "stream";
 
 /// struct containing all objects needed to read from a unix stream.
 struct UnixStreamListener {
@@ -108,9 +109,15 @@ impl UnixStreamListener {
                     return ReadSocketClosed.into();
                 }
                 Ok(_) => {
-                    return match self.rotating_buffer.get_requests() {
-                        Ok(requests) => ReceivedValues(requests),
-                        Err(err) => UnhandledError(err.into()).into(),
+                    match self.rotating_buffer.get_requests() {
+                        Ok(requests) => {
+                            if !requests.is_empty() {
+                                return ReceivedValues(requests);
+                            }
+                            // continue to read from socket
+                            continue;
+                        }
+                        Err(err) => return UnhandledError(err.into()).into(),
                     };
                 }
                 Err(ref e)
@@ -165,9 +172,10 @@ async fn write_closing_error(
     err: ClosingError,
     callback_index: u32,
     writer: &Rc<Writer>,
+    identifier: &str,
 ) -> Result<(), io::Error> {
     let err = err.err_message;
-    log_error("client creation", err.as_str());
+    log_error(identifier, err.as_str());
     let mut response = Response::new();
     response.callback_idx = callback_index;
     response.value = Some(response::response::Value::ClosingError(err.into()));
@@ -179,60 +187,71 @@ async fn write_result(
     resp_result: ClientUsageResult<Value>,
     callback_index: u32,
     writer: &Rc<Writer>,
+    command_span_ptr: Option<u64>,
 ) -> Result<(), io::Error> {
     let mut response = Response::new();
     response.callback_idx = callback_index;
+    response.is_push = false;
+    response.root_span_ptr = command_span_ptr;
+    let otel_command_span: Option<GlideSpan> = get_unsafe_span_from_ptr(command_span_ptr);
     response.value = match resp_result {
         Ok(Value::Okay) => Some(response::response::Value::ConstantResponse(
             response::ConstantResponse::OK.into(),
         )),
         Ok(value) => {
+            if let Some(span) = otel_command_span {
+                span.set_status(GlideSpanStatus::Ok);
+            }
             if value != Value::Nil {
                 // Since null values don't require any additional data, they can be sent without any extra effort.
                 // Move the value to the heap and leak it. The wrapper should use `Box::from_raw` to recreate the box, use the value, and drop the allocation.
-                let pointer = Box::leak(Box::new(value));
-                let raw_pointer = pointer as *mut redis::Value;
+                let reference = Box::leak(Box::new(value));
+                let raw_pointer = from_mut(reference);
                 Some(response::response::Value::RespPointer(raw_pointer as u64))
             } else {
                 None
             }
         }
-        Err(ClienUsageError::InternalError(error_message)) => {
+        Err(ClientUsageError::Internal(error_message)) => {
             log_error("internal error", &error_message);
+            if let Some(span) = otel_command_span {
+                span.set_status(GlideSpanStatus::Error((&error_message).into()));
+            }
             Some(response::response::Value::ClosingError(
                 error_message.into(),
             ))
         }
-        Err(ClienUsageError::RedisError(err)) => {
-            let error_message = err.to_string();
-            if err.is_connection_refusal() {
-                log_error("response error", &error_message);
-                Some(response::response::Value::ClosingError(
-                    error_message.into(),
-                ))
-            } else {
-                log_warn("received error", error_message.as_str());
-                let mut request_error = response::RequestError::default();
-                if err.is_connection_dropped() {
-                    request_error.type_ = response::RequestErrorType::Disconnect.into();
-                    request_error.message = format!(
-                        "Received connection error `{error_message}`. Will attempt to reconnect"
-                    )
-                    .into();
-                } else if err.is_timeout() {
-                    request_error.type_ = response::RequestErrorType::Timeout.into();
-                    request_error.message = error_message.into();
-                } else {
-                    request_error.type_ = match err.kind() {
-                        redis::ErrorKind::ExecAbortError => {
-                            response::RequestErrorType::ExecAbort.into()
-                        }
-                        _ => response::RequestErrorType::Unspecified.into(),
-                    };
-                    request_error.message = error_message.into();
-                }
-                Some(response::response::Value::RequestError(request_error))
+        Err(ClientUsageError::User(error_message)) => {
+            log_error("user error", &error_message);
+            if let Some(span) = otel_command_span {
+                span.set_status(GlideSpanStatus::Error((&error_message).into()));
             }
+            let request_error = response::RequestError {
+                type_: response::RequestErrorType::Unspecified.into(),
+                message: error_message.into(),
+                ..Default::default()
+            };
+            Some(response::response::Value::RequestError(request_error))
+        }
+        Err(ClientUsageError::Redis(err)) => {
+            let error_message = error_message(&err);
+            log_warn("received error", error_message.as_str());
+            log_debug("received error", format!("for callback {callback_index}"));
+            if let Some(span) = otel_command_span {
+                span.set_status(GlideSpanStatus::Error((&error_message).into()));
+            }
+            let request_error = response::RequestError {
+                type_: match error_type(&err) {
+                    RequestErrorType::Unspecified => response::RequestErrorType::Unspecified,
+                    RequestErrorType::ExecAbort => response::RequestErrorType::ExecAbort,
+                    RequestErrorType::Timeout => response::RequestErrorType::Timeout,
+                    RequestErrorType::Disconnect => response::RequestErrorType::Disconnect,
+                }
+                .into(),
+                message: error_message.into(),
+                ..Default::default()
+            };
+            Some(response::response::Value::RequestError(request_error))
         }
     };
     write_to_writer(response, writer).await
@@ -260,90 +279,14 @@ async fn write_to_writer(response: Response, writer: &Rc<Writer>) -> Result<(), 
     }
 }
 
-fn get_two_word_command(first: &str, second: &str) -> Cmd {
-    let mut cmd = cmd(first);
-    cmd.arg(second);
-    cmd
-}
-
 fn get_command(request: &Command) -> Option<Cmd> {
-    let request_enum = request
-        .request_type
-        .enum_value_or(RequestType::InvalidRequest);
-    match request_enum {
-        RequestType::InvalidRequest => None,
-        RequestType::CustomCommand => Some(Cmd::new()),
-        RequestType::GetString => Some(cmd("GET")),
-        RequestType::SetString => Some(cmd("SET")),
-        RequestType::Ping => Some(cmd("PING")),
-        RequestType::Info => Some(cmd("INFO")),
-        RequestType::Del => Some(cmd("DEL")),
-        RequestType::Select => Some(cmd("SELECT")),
-        RequestType::ConfigGet => Some(get_two_word_command("CONFIG", "GET")),
-        RequestType::ConfigSet => Some(get_two_word_command("CONFIG", "SET")),
-        RequestType::ConfigResetStat => Some(get_two_word_command("CONFIG", "RESETSTAT")),
-        RequestType::ConfigRewrite => Some(get_two_word_command("CONFIG", "REWRITE")),
-        RequestType::ClientGetName => Some(get_two_word_command("CLIENT", "GETNAME")),
-        RequestType::ClientGetRedir => Some(get_two_word_command("CLIENT", "GETREDIR")),
-        RequestType::ClientId => Some(get_two_word_command("CLIENT", "ID")),
-        RequestType::ClientInfo => Some(get_two_word_command("CLIENT", "INFO")),
-        RequestType::ClientKill => Some(get_two_word_command("CLIENT", "KILL")),
-        RequestType::ClientList => Some(get_two_word_command("CLIENT", "LIST")),
-        RequestType::ClientNoEvict => Some(get_two_word_command("CLIENT", "NO-EVICT")),
-        RequestType::ClientNoTouch => Some(get_two_word_command("CLIENT", "NO-TOUCH")),
-        RequestType::ClientPause => Some(get_two_word_command("CLIENT", "PAUSE")),
-        RequestType::ClientReply => Some(get_two_word_command("CLIENT", "REPLY")),
-        RequestType::ClientSetInfo => Some(get_two_word_command("CLIENT", "SETINFO")),
-        RequestType::ClientSetName => Some(get_two_word_command("CLIENT", "SETNAME")),
-        RequestType::ClientUnblock => Some(get_two_word_command("CLIENT", "UNBLOCK")),
-        RequestType::ClientUnpause => Some(get_two_word_command("CLIENT", "UNPAUSE")),
-        RequestType::Expire => Some(cmd("EXPIRE")),
-        RequestType::HashSet => Some(cmd("HSET")),
-        RequestType::HashGet => Some(cmd("HGET")),
-        RequestType::HashDel => Some(cmd("HDEL")),
-        RequestType::HashExists => Some(cmd("HEXISTS")),
-        RequestType::MSet => Some(cmd("MSET")),
-        RequestType::MGet => Some(cmd("MGET")),
-        RequestType::Incr => Some(cmd("INCR")),
-        RequestType::IncrBy => Some(cmd("INCRBY")),
-        RequestType::IncrByFloat => Some(cmd("INCRBYFLOAT")),
-        RequestType::Decr => Some(cmd("DECR")),
-        RequestType::DecrBy => Some(cmd("DECRBY")),
-        RequestType::HashGetAll => Some(cmd("HGETALL")),
-        RequestType::HashMSet => Some(cmd("HMSET")),
-        RequestType::HashMGet => Some(cmd("HMGET")),
-        RequestType::HashIncrBy => Some(cmd("HINCRBY")),
-        RequestType::HashIncrByFloat => Some(cmd("HINCRBYFLOAT")),
-        RequestType::LPush => Some(cmd("LPUSH")),
-        RequestType::LPop => Some(cmd("LPOP")),
-        RequestType::RPush => Some(cmd("RPUSH")),
-        RequestType::RPop => Some(cmd("RPOP")),
-        RequestType::LLen => Some(cmd("LLEN")),
-        RequestType::LRem => Some(cmd("LREM")),
-        RequestType::LRange => Some(cmd("LRANGE")),
-        RequestType::LTrim => Some(cmd("LTRIM")),
-        RequestType::SAdd => Some(cmd("SADD")),
-        RequestType::SRem => Some(cmd("SREM")),
-        RequestType::SMembers => Some(cmd("SMEMBERS")),
-        RequestType::SCard => Some(cmd("SCARD")),
-        RequestType::PExpireAt => Some(cmd("PEXPIREAT")),
-        RequestType::PExpire => Some(cmd("PEXPIRE")),
-        RequestType::ExpireAt => Some(cmd("EXPIREAT")),
-        RequestType::Exists => Some(cmd("EXISTS")),
-        RequestType::Unlink => Some(cmd("UNLINK")),
-        RequestType::TTL => Some(cmd("TTL")),
-        RequestType::Zadd => Some(cmd("ZADD")),
-        RequestType::Zrem => Some(cmd("ZREM")),
-        RequestType::Zrange => Some(cmd("ZRANGE")),
-        RequestType::Zcard => Some(cmd("ZCARD")),
-        RequestType::Zcount => Some(cmd("ZCOUNT")),
-        RequestType::ZIncrBy => Some(cmd("ZINCRBY")),
-    }
+    let request_type: crate::request_type::RequestType = request.request_type.into();
+    request_type.get_command()
 }
 
-fn get_redis_command(command: &Command) -> Result<Cmd, ClienUsageError> {
+fn get_redis_command(command: &Command) -> Result<Cmd, ClientUsageError> {
     let Some(mut cmd) = get_command(command) else {
-        return Err(ClienUsageError::InternalError(format!(
+        return Err(ClientUsageError::Internal(format!(
             "Received invalid request type: {:?}",
             command.request_type
         )));
@@ -352,21 +295,27 @@ fn get_redis_command(command: &Command) -> Result<Cmd, ClienUsageError> {
     match &command.args {
         Some(command::Args::ArgsArray(args_vec)) => {
             for arg in args_vec.args.iter() {
-                cmd.arg(arg.as_bytes());
+                cmd.arg(arg.as_ref());
             }
         }
         Some(command::Args::ArgsVecPointer(pointer)) => {
-            let res = *unsafe { Box::from_raw(*pointer as *mut Vec<String>) };
+            let res = *unsafe { Box::from_raw(*pointer as *mut Vec<Bytes>) };
             for arg in res {
-                cmd.arg(arg.as_bytes());
+                cmd.arg(arg.as_ref());
             }
         }
         None => {
-            return Err(ClienUsageError::InternalError(
-                "Failed to get request arguemnts, no arguments are set".to_string(),
+            return Err(ClientUsageError::Internal(
+                "Failed to get request arguments, no arguments are set".to_string(),
             ));
         }
     };
+
+    if cmd.args_iter().next().is_none() {
+        return Err(ClientUsageError::User(
+            "Received command without a command name or arguments".into(),
+        ));
+    }
 
     Ok(cmd)
 }
@@ -376,38 +325,138 @@ async fn send_command(
     mut client: Client,
     routing: Option<RoutingInfo>,
 ) -> ClientUsageResult<Value> {
-    client
+    let child_span = create_child_span(cmd.span().as_ref(), "send_command");
+    let res = client
         .send_command(&cmd, routing)
+        .await
+        .map_err(|err| err.into());
+
+    if let Some(c) = child_span {
+        c.end()
+    };
+    res
+}
+
+// Parse the cluster scan command parameters from protobuf and send the command to redis-rs.
+async fn cluster_scan(cluster_scan: ClusterScan, mut client: Client) -> ClientUsageResult<Value> {
+    // Since we don't send the cluster scan as a usual command, but through a special function in redis-rs library,
+    // we need to handle the command separately.
+    // Specifically, we need to handle the cursor, which is not the cursor returned from the server,
+    // but the ID of the ScanStateRC, stored in the cluster scan container.
+    // We need to get the ref from the table or create a new one if the cursor is empty.
+    let cursor: String = cluster_scan.cursor.into();
+    let cluster_scan_cursor = if cursor.is_empty() {
+        ScanStateRC::new()
+    } else {
+        get_cluster_scan_cursor(cursor)?
+    };
+    let mut cluster_scan_args_builder =
+        ClusterScanArgs::builder().allow_non_covered_slots(cluster_scan.allow_non_covered_slots);
+    if let Some(match_pattern) = cluster_scan.match_pattern {
+        cluster_scan_args_builder =
+            cluster_scan_args_builder.with_match_pattern::<Bytes>(match_pattern);
+    }
+    if let Some(count) = cluster_scan.count {
+        cluster_scan_args_builder = cluster_scan_args_builder.with_count(count as u32);
+    }
+    if let Some(object_type) = cluster_scan.object_type {
+        cluster_scan_args_builder =
+            cluster_scan_args_builder.with_object_type(object_type.to_string().into());
+    }
+    let cluster_scan_args = cluster_scan_args_builder.build();
+
+    client
+        .cluster_scan(&cluster_scan_cursor, cluster_scan_args)
         .await
         .map_err(|err| err.into())
 }
 
 async fn invoke_script(
-    script: ScriptInvocation,
+    hash: Chars,
+    keys: Option<Vec<Bytes>>,
+    args: Option<Vec<Bytes>>,
     mut client: Client,
     routing: Option<RoutingInfo>,
 ) -> ClientUsageResult<Value> {
+    // convert Vec<bytes> to vec<[u8]>
+    let keys: Vec<&[u8]> = keys
+        .as_ref()
+        .map(|keys| keys.iter().map(|e| e.as_ref()).collect())
+        .unwrap_or_default();
+    let args: Vec<&[u8]> = args
+        .as_ref()
+        .map(|keys| keys.iter().map(|e| e.as_ref()).collect())
+        .unwrap_or_default();
+
     client
-        .invoke_script(&script.hash, script.keys, script.args, routing)
+        .invoke_script(&hash, &keys, &args, routing)
         .await
         .map_err(|err| err.into())
 }
 
-async fn send_transaction(
-    request: Transaction,
-    mut client: Client,
+/// Creates a child span for telemetry if telemetry is enabled
+fn create_child_span(span: Option<&GlideSpan>, name: &str) -> Option<GlideSpan> {
+    // Early return if no parent span is provided
+    let parent_span = span?;
+
+    match parent_span.add_span(name) {
+        Ok(child_span) => Some(child_span),
+        Err(error_msg) => {
+            log_error(
+                "OpenTelemetry error",
+                format!("Failed to create child span with name `{name}`. Error: {error_msg:?}"),
+            );
+            None
+        }
+    }
+}
+
+async fn send_batch(
+    request: Batch,
+    client: &mut Client,
     routing: Option<RoutingInfo>,
+    command_span: Option<GlideSpan>,
 ) -> ClientUsageResult<Value> {
     let mut pipeline = redis::Pipeline::with_capacity(request.commands.capacity());
-    pipeline.atomic();
+    pipeline.set_pipeline_span(command_span);
+    let child_span = create_child_span(pipeline.span().as_ref(), "send_batch");
+
+    if request.is_atomic {
+        pipeline.atomic();
+    }
     for command in request.commands {
         pipeline.add_command(get_redis_command(&command)?);
     }
 
-    client
-        .send_transaction(&pipeline, routing)
-        .await
-        .map_err(|err| err.into())
+    let res = match request.is_atomic {
+        true => client
+            .send_transaction(
+                &pipeline,
+                routing,
+                request.timeout,
+                request.raise_on_error.unwrap_or_default(),
+            )
+            .await
+            .map_err(|err| err.into()),
+        false => client
+            .send_pipeline(
+                &pipeline,
+                routing,
+                request.raise_on_error.unwrap_or_default(),
+                request.timeout,
+                PipelineRetryStrategy {
+                    retry_server_error: request.retry_server_error.unwrap_or_default(),
+                    retry_connection_error: request.retry_connection_error.unwrap_or_default(),
+                },
+            )
+            .await
+            .map_err(|err| err.into()),
+    };
+
+    if let Some(c) = child_span {
+        c.end()
+    };
+    res
 }
 
 fn get_slot_addr(slot_type: &protobuf::EnumOrUnknown<SlotTypes>) -> ClientUsageResult<SlotAddr> {
@@ -417,16 +466,14 @@ fn get_slot_addr(slot_type: &protobuf::EnumOrUnknown<SlotTypes>) -> ClientUsageR
             SlotTypes::Primary => SlotAddr::Master,
             SlotTypes::Replica => SlotAddr::ReplicaRequired,
         })
-        .map_err(|id| {
-            ClienUsageError::InternalError(format!("Received unexpected slot id type {id}"))
-        })
+        .map_err(|id| ClientUsageError::Internal(format!("Received unexpected slot id type {id}")))
 }
 
 fn get_route(
     route: Option<Box<Routes>>,
     cmd: Option<&Cmd>,
 ) -> ClientUsageResult<Option<RoutingInfo>> {
-    use crate::redis_request::routes::Value;
+    use crate::command_request::routes::Value;
     let Some(route) = route.and_then(|route| route.value) else {
         return Ok(None);
     };
@@ -439,22 +486,19 @@ fn get_route(
     match route {
         Value::SimpleRoutes(simple_route) => {
             let simple_route = simple_route.enum_value().map_err(|id| {
-                ClienUsageError::InternalError(format!(
-                    "Received unexpected simple route type {id}"
-                ))
+                ClientUsageError::Internal(format!("Received unexpected simple route type {id}"))
             })?;
             match simple_route {
-                crate::redis_request::SimpleRoutes::AllNodes => Ok(Some(RoutingInfo::MultiNode((
-                    MultipleNodeRoutingInfo::AllNodes,
-                    get_response_policy(cmd),
-                )))),
-                crate::redis_request::SimpleRoutes::AllPrimaries => {
+                crate::command_request::SimpleRoutes::AllNodes => Ok(Some(RoutingInfo::MultiNode(
+                    (MultipleNodeRoutingInfo::AllNodes, get_response_policy(cmd)),
+                ))),
+                crate::command_request::SimpleRoutes::AllPrimaries => {
                     Ok(Some(RoutingInfo::MultiNode((
                         MultipleNodeRoutingInfo::AllMasters,
                         get_response_policy(cmd),
                     ))))
                 }
-                crate::redis_request::SimpleRoutes::Random => {
+                crate::command_request::SimpleRoutes::Random => {
                     Ok(Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)))
                 }
             }
@@ -471,54 +515,164 @@ fn get_route(
                 get_slot_addr(&slot_id_route.slot_type)?,
             )),
         ))),
+        Value::ByAddressRoute(by_address_route) => match u16::try_from(by_address_route.port) {
+            Ok(port) => Ok(Some(RoutingInfo::SingleNode(
+                SingleNodeRoutingInfo::ByAddress {
+                    host: by_address_route.host.to_string(),
+                    port,
+                },
+            ))),
+            Err(err) => {
+                log_warn("get route", format!("Failed to parse port: {err:?}"));
+                Ok(None)
+            }
+        },
     }
 }
 
-fn handle_request(request: RedisRequest, client: Client, writer: Rc<Writer>) {
+fn handle_request(request: CommandRequest, mut client: Client, writer: Rc<Writer>) {
     task::spawn_local(async move {
-        let result = match request.command {
-            Some(action) => match action {
-                redis_request::Command::SingleCommand(command) => {
-                    match get_redis_command(&command) {
-                        Ok(cmd) => match get_route(request.route.0, Some(&cmd)) {
-                            Ok(routes) => send_command(cmd, client, routes).await,
+        let mut updated_inflight_counter = true;
+        let client_clone = client.clone();
+
+        let result = match client.reserve_inflight_request() {
+            false => {
+                updated_inflight_counter = false;
+                Err(ClientUsageError::User(
+                    "Reached maximum inflight requests".to_string(),
+                ))
+            }
+            true => match request.command {
+                Some(action) => match action {
+                    command_request::Command::ClusterScan(cluster_scan_command) => {
+                        //TODO: handle scan command - https://github.com/valkey-io/valkey-glide/issues/3506
+                        cluster_scan(cluster_scan_command, client).await
+                    }
+                    command_request::Command::SingleCommand(command) => {
+                        match get_redis_command(&command) {
+                            Ok(mut cmd) => match get_route(request.route.0, Some(&cmd)) {
+                                Ok(routes) => {
+                                    cmd.set_span(get_unsafe_span_from_ptr(request.root_span_ptr));
+                                    send_command(cmd, client, routes).await
+                                }
+                                Err(e) => Err(e),
+                            },
                             Err(e) => Err(e),
-                        },
-                        Err(e) => Err(e),
+                        }
                     }
-                }
-                redis_request::Command::Transaction(transaction) => {
-                    match get_route(request.route.0, None) {
-                        Ok(routes) => send_transaction(transaction, client, routes).await,
-                        Err(e) => Err(e),
+                    command_request::Command::Batch(batch) => {
+                        match get_route(request.route.0, None) {
+                            Ok(routes) => {
+                                let otel_command_span =
+                                    get_unsafe_span_from_ptr(request.root_span_ptr);
+                                send_batch(batch, &mut client, routes, otel_command_span).await
+                            }
+                            Err(e) => Err(e),
+                        }
                     }
-                }
-                redis_request::Command::ScriptInvocation(script) => {
-                    match get_route(request.route.0, None) {
-                        Ok(routes) => invoke_script(script, client, routes).await,
-                        Err(e) => Err(e),
+
+                    command_request::Command::ScriptInvocation(script) => {
+                        match get_route(request.route.0, None) {
+                            Ok(routes) => {
+                                invoke_script(
+                                    script.hash,
+                                    Some(script.keys),
+                                    Some(script.args),
+                                    client,
+                                    routes,
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e),
+                        }
                     }
+                    command_request::Command::ScriptInvocationPointers(script) => {
+                        let keys = script
+                            .keys_pointer
+                            .map(|pointer| *unsafe { Box::from_raw(pointer as *mut Vec<Bytes>) });
+                        let args = script
+                            .args_pointer
+                            .map(|pointer| *unsafe { Box::from_raw(pointer as *mut Vec<Bytes>) });
+                        match get_route(request.route.0, None) {
+                            Ok(routes) => {
+                                invoke_script(script.hash, keys, args, client, routes).await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    command_request::Command::UpdateConnectionPassword(
+                        update_connection_password_command,
+                    ) => client
+                        .update_connection_password(
+                            update_connection_password_command
+                                .password
+                                .map(|chars| chars.to_string()),
+                            update_connection_password_command.immediate_auth,
+                        )
+                        .await
+                        .map_err(|err| err.into()),
+                },
+                None => {
+                    log_debug(
+                        "received error",
+                        format!(
+                            "Received empty request for callback {}",
+                            request.callback_idx
+                        ),
+                    );
+                    Err(ClientUsageError::Internal(
+                        "Received empty request".to_string(),
+                    ))
                 }
             },
-            None => Err(ClienUsageError::InternalError(
-                "Received empty request".to_string(),
-            )),
         };
 
-        let _res = write_result(result, request.callback_idx, &writer).await;
+        if updated_inflight_counter {
+            client_clone.release_inflight_request();
+        }
+
+        let _res = write_result(result, request.callback_idx, &writer, request.root_span_ptr).await;
     });
 }
 
 async fn handle_requests(
-    received_requests: Vec<RedisRequest>,
+    received_requests: Vec<CommandRequest>,
     client: &Client,
     writer: &Rc<Writer>,
 ) {
     for request in received_requests {
-        handle_request(request, client.clone(), writer.clone())
+        handle_request(request, client.clone(), writer.clone());
     }
     // Yield to ensure that the subtasks aren't starved.
     task::yield_now().await;
+}
+
+/// This function converts a raw pointer to a GlideSpan into a safe Rust reference.
+/// It handles the unsafe pointer operations internally, incrementing the reference count
+/// to ensure the span remains valid while in use.
+///
+/// # Safety
+///
+/// This function is marked as unsafe because it dereferences a raw pointer. The caller
+/// must ensure that:
+/// * The pointer is valid and points to a properly allocated GlideSpan
+/// * The pointer is properly aligned
+/// * The data pointed to is not modified while the returned reference is in use
+/// * The pointer is not used after the referenced data is dropped
+///
+/// # Arguments
+///
+/// * `command_span` - An optional raw pointer (as u64) to a GlideSpan
+///
+/// # Returns
+///
+/// * `Some(GlideSpan)` - A cloned GlideSpan if the pointer is valid
+/// * `None` - If the pointer is None
+fn get_unsafe_span_from_ptr(command_span: Option<u64>) -> Option<GlideSpan> {
+    command_span.map(|command_span| unsafe {
+        Arc::increment_strong_count(command_span as *const GlideSpan);
+        (*Arc::from_raw(command_span as *const GlideSpan)).clone()
+    })
 }
 
 pub fn close_socket(socket_path: &String) {
@@ -529,25 +683,27 @@ pub fn close_socket(socket_path: &String) {
 async fn create_client(
     writer: &Rc<Writer>,
     request: ConnectionRequest,
+    push_tx: Option<mpsc::UnboundedSender<PushInfo>>,
 ) -> Result<Client, ClientCreationError> {
-    let client = match Client::new(request).await {
+    let client = match Client::new(request.into(), push_tx).await {
         Ok(client) => client,
         Err(err) => return Err(ClientCreationError::ConnectionError(err)),
     };
-    write_result(Ok(Value::Okay), 0, writer).await?;
+    write_result(Ok(Value::Okay), 0, writer, None).await?;
     Ok(client)
 }
 
 async fn wait_for_connection_configuration_and_create_client(
     client_listener: &mut UnixStreamListener,
     writer: &Rc<Writer>,
+    push_tx: Option<mpsc::UnboundedSender<PushInfo>>,
 ) -> Result<Client, ClientCreationError> {
     // Wait for the server's address
     match client_listener.next_values::<ConnectionRequest>().await {
         Closed(reason) => Err(ClientCreationError::SocketListenerClosed(reason)),
         ReceivedValues(mut received_requests) => {
             if let Some(request) = received_requests.pop() {
-                create_client(writer, request).await
+                create_client(writer, request, push_tx).await
             } else {
                 Err(ClientCreationError::UnhandledError(
                     "No received requests".to_string(),
@@ -574,6 +730,35 @@ async fn read_values_loop(
     }
 }
 
+async fn push_manager_loop(mut push_rx: mpsc::UnboundedReceiver<PushInfo>, writer: Rc<Writer>) {
+    loop {
+        let result = push_rx.recv().await;
+        match result {
+            None => {
+                log_error("push manager loop", "got None from push manager");
+                return;
+            }
+            Some(push_msg) => {
+                log_debug("push manager loop", format!("got PushInfo: {push_msg:?}"));
+                let mut response = Response::new();
+                response.callback_idx = 0; // callback_idx is not used with push notifications
+                response.is_push = true;
+                response.value = {
+                    let push_val = Value::Push {
+                        kind: (push_msg.kind),
+                        data: (push_msg.data),
+                    };
+                    let reference = Box::leak(Box::new(push_val));
+                    let raw_pointer = from_mut(reference);
+                    Some(response::response::Value::RespPointer(raw_pointer as u64))
+                };
+
+                _ = write_to_writer(response, &writer).await;
+            }
+        }
+    }
+}
+
 async fn listen_on_client_stream(socket: UnixStream) {
     let socket = Rc::new(socket);
     // Spawn a new task to listen on this client's stream
@@ -581,14 +766,18 @@ async fn listen_on_client_stream(socket: UnixStream) {
     let mut client_listener = UnixStreamListener::new(socket.clone());
     let accumulated_outputs = Cell::new(Vec::new());
     let (sender, mut receiver) = channel(1);
+    let (push_tx, push_rx) = tokio::sync::mpsc::unbounded_channel();
     let writer = Rc::new(Writer {
         socket,
         lock: write_lock,
         accumulated_outputs,
         closing_sender: sender,
     });
-    let client_creation =
-        wait_for_connection_configuration_and_create_client(&mut client_listener, &writer);
+    let client_creation = wait_for_connection_configuration_and_create_client(
+        &mut client_listener,
+        &writer,
+        Some(push_tx),
+    );
     let client = match client_creation.await {
         Ok(conn) => conn,
         Err(ClientCreationError::SocketListenerClosed(ClosingReason::ReadSocketClosed)) => {
@@ -601,14 +790,27 @@ async fn listen_on_client_stream(socket: UnixStream) {
         }
         Err(ClientCreationError::SocketListenerClosed(reason)) => {
             let err_message = format!("Socket listener closed due to {reason:?}");
-            let _res = write_closing_error(ClosingError { err_message }, u32::MAX, &writer).await;
+            let _res = write_closing_error(
+                ClosingError { err_message },
+                u32::MAX,
+                &writer,
+                "client creation",
+            )
+            .await;
             return;
         }
         Err(e @ ClientCreationError::UnhandledError(_))
         | Err(e @ ClientCreationError::IO(_))
         | Err(e @ ClientCreationError::ConnectionError(_)) => {
             let err_message = e.to_string();
-            let _res = write_closing_error(ClosingError { err_message }, u32::MAX, &writer).await;
+            log_error("client creation", &err_message);
+            let _res = write_closing_error(
+                ClosingError { err_message },
+                u32::MAX,
+                &writer,
+                "client creation",
+            )
+            .await;
             return;
         }
     };
@@ -616,7 +818,7 @@ async fn listen_on_client_stream(socket: UnixStream) {
     tokio::select! {
             reader_closing = read_values_loop(client_listener, &client, writer.clone()) => {
                 if let ClosingReason::UnhandledError(err) = reader_closing {
-                    let _res = write_closing_error(ClosingError{err_message: err.to_string()}, u32::MAX, &writer).await;
+                    let _res = write_closing_error(ClosingError{err_message: err.to_string()}, u32::MAX, &writer, "client closing").await;
                 };
                 log_trace("client closing", "reader closed");
             },
@@ -626,114 +828,12 @@ async fn listen_on_client_stream(socket: UnixStream) {
                 } else {
                     log_trace("client closing", "writer closed");
                 }
+            },
+            _ = push_manager_loop(push_rx, writer.clone()) => {
+                log_trace("client closing", "push manager closed");
             }
     }
     log_trace("client closing", "closing connection");
-}
-
-enum SocketCreationResult {
-    // Socket creation was successful, returned a socket listener.
-    Created(UnixListener),
-    // There's an existing a socket listener.
-    PreExisting,
-    // Socket creation failed with an error.
-    Err(io::Error),
-}
-
-impl SocketListener {
-    fn new(socket_path: String) -> Self {
-        SocketListener {
-            socket_path,
-            // Don't cleanup the socket resources unless we know that the socket is in use, and owned by this listener.
-            cleanup_socket: false,
-        }
-    }
-
-    /// Return true if it's possible to connect to socket.
-    async fn socket_is_available(&self) -> bool {
-        if UnixStream::connect(&self.socket_path).await.is_ok() {
-            return true;
-        }
-
-        let retry_strategy = get_fixed_interval_backoff(10, 3);
-
-        let action = || async {
-            UnixStream::connect(&self.socket_path)
-                .await
-                .map(|_| ())
-                .map_err(|_| ())
-        };
-        let result = Retry::spawn(retry_strategy.get_iterator(), action).await;
-        result.is_ok()
-    }
-
-    async fn get_socket_listener(&self) -> SocketCreationResult {
-        const RETRY_COUNT: u8 = 3;
-        let mut retries = RETRY_COUNT;
-        while retries > 0 {
-            match UnixListener::bind(self.socket_path.clone()) {
-                Ok(listener) => {
-                    return SocketCreationResult::Created(listener);
-                }
-                Err(err) if err.kind() == AddrInUse => {
-                    if self.socket_is_available().await {
-                        return SocketCreationResult::PreExisting;
-                    } else {
-                        // socket file might still exist, even if nothing is listening on it.
-                        close_socket(&self.socket_path);
-                        retries -= 1;
-                        continue;
-                    }
-                }
-                Err(err) => {
-                    return SocketCreationResult::Err(err);
-                }
-            }
-        }
-        SocketCreationResult::Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Failed to connect to socket",
-        ))
-    }
-
-    pub(crate) async fn listen_on_socket<InitCallback>(&mut self, init_callback: InitCallback)
-    where
-        InitCallback: FnOnce(Result<String, String>) + Send + 'static,
-    {
-        // Bind to socket
-        let listener = match self.get_socket_listener().await {
-            SocketCreationResult::Created(listener) => listener,
-            SocketCreationResult::Err(err) => {
-                log_info("listen_on_socket", format!("failed with error: {err}"));
-                init_callback(Err(err.to_string()));
-                return;
-            }
-            SocketCreationResult::PreExisting => {
-                init_callback(Ok(self.socket_path.clone()));
-                return;
-            }
-        };
-
-        self.cleanup_socket = true;
-        init_callback(Ok(self.socket_path.clone()));
-        let local_set_pool = LocalPoolHandle::new(num_cpus::get());
-        loop {
-            tokio::select! {
-                listen_v = listener.accept() => {
-                    if let Ok((stream, _addr)) = listen_v {
-                        // New client
-                        local_set_pool.spawn_pinned(move || {
-                            listen_on_client_stream(stream)
-                        });
-                    } else if listen_v.is_err() {
-                        return
-                    }
-                },
-                // Interrupt was received, close the socket
-                _ = handle_signals() => return
-            }
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -768,15 +868,18 @@ enum ClientCreationError {
 
 /// Enum describing errors received during client usage.
 #[derive(Debug, Error)]
-enum ClienUsageError {
+enum ClientUsageError {
     #[error("Redis error: {0}")]
-    RedisError(#[from] RedisError),
+    Redis(#[from] RedisError),
     /// An error that stems from wrong behavior of the client.
     #[error("Internal error: {0}")]
-    InternalError(String),
+    Internal(String),
+    /// An error that stems from wrong behavior of the user.
+    #[error("User error: {0}")]
+    User(String),
 }
 
-type ClientUsageResult<T> = Result<T, ClienUsageError>;
+type ClientUsageResult<T> = Result<T, ClientUsageError>;
 
 /// Defines errors caused the connection to close.
 #[derive(Debug, Clone)]
@@ -786,19 +889,18 @@ struct ClosingError {
 }
 
 /// Get the socket full path.
-/// The socket file name will contain the process ID and will try to be saved into the user's runtime directory
-/// (e.g. /run/user/1000) in Unix systems. If the runtime dir isn't found, the socket file will be saved to the temp dir.
+/// On Unix-based systems, we use the /tmp directory for the socket file to ensure a predictable and short path,
+/// avoiding issues with the ~100-character limit on Unix domain socket paths.
+/// While placing the socket in /tmp has known security concerns, they are less relevant here since the socket is used for intraprocess communication only.
+/// To further enhance security, we include a UUID in the socket filename and restrict socket permissions to the owner after binding.
+///
 /// For Windows, the socket file will be saved to %AppData%\Local.
 pub fn get_socket_path_from_name(socket_name: String) -> String {
     let base_dirs = BaseDirs::new().expect("Failed to create BaseDirs");
-    let tmp_dir;
     let folder = if cfg!(windows) {
         base_dirs.data_local_dir()
     } else {
-        base_dirs.runtime_dir().unwrap_or({
-            tmp_dir = env::temp_dir();
-            tmp_dir.as_path()
-        })
+        std::path::Path::new(UNIX_SOCKER_DIR)
     };
     folder
         .join(socket_name)
@@ -809,25 +911,17 @@ pub fn get_socket_path_from_name(socket_name: String) -> String {
 
 /// Get the socket path as a string
 pub fn get_socket_path() -> String {
-    let socket_name = format!("{}-{}", SOCKET_FILE_NAME, std::process::id());
-    get_socket_path_from_name(socket_name)
-}
-
-async fn handle_signals() {
-    // Handle Unix signals
-    let mut signals =
-        Signals::new([SIGTERM, SIGQUIT, SIGINT, SIGHUP]).expect("Failed creating signals");
-    loop {
-        if let Some(signal) = signals.next().await {
-            match signal {
-                SIGTERM | SIGQUIT | SIGINT | SIGHUP => {
-                    log_info("connection", format!("Signal {signal:?} received"));
-                    return;
-                }
-                _ => continue,
-            }
-        }
-    }
+    // Ensure the socket name is unique by appending the process ID and a random UUID
+    // to the socket name. The UUID is used to ensure that the socket name is unique for situations in which PID can be resused such as with dockers.
+    static SOCKET_NAME: Lazy<String> = Lazy::new(|| {
+        format!(
+            "{}-{}-{}.sock",
+            SOCKET_FILE_NAME,
+            std::process::id(),
+            Uuid::new_v4(),
+        )
+    });
+    get_socket_path_from_name(SOCKET_NAME.clone())
 }
 
 /// This function is exposed only for the sake of testing with a nonstandard `socket_path`.
@@ -837,23 +931,118 @@ pub fn start_socket_listener_internal<InitCallback>(
     init_callback: InitCallback,
     socket_path: Option<String>,
 ) where
-    InitCallback: FnOnce(Result<String, String>) + Send + 'static,
+    InitCallback: FnOnce(Result<String, String>) + Send + Clone + 'static,
 {
-    thread::Builder::new()
-        .name("socket_listener_thread".to_string())
-        .spawn(move || {
-            let runtime = Builder::new_current_thread().enable_all().build();
-            match runtime {
-                Ok(runtime) => {
-                    let mut listener = Disposable::new(SocketListener::new(
-                        socket_path.unwrap_or_else(get_socket_path),
-                    ));
-                    runtime.block_on(listener.listen_on_socket(init_callback));
+    static INITIALIZED_SOCKETS: Lazy<RwLock<HashSet<String>>> =
+        Lazy::new(|| RwLock::new(HashSet::new()));
+
+    let socket_path = socket_path.unwrap_or_else(get_socket_path);
+
+    {
+        // Optimize for already initialized
+        let initialized_sockets = INITIALIZED_SOCKETS
+            .read()
+            .expect("Failed to acquire sockets db read guard");
+        if initialized_sockets.contains(&socket_path) {
+            init_callback(Ok(socket_path.clone()));
+            return;
+        }
+    }
+    // Retry with write lock, will be dropped upon the function completion
+    let mut sockets_write_guard = INITIALIZED_SOCKETS
+        .write()
+        .expect("Failed to acquire sockets db write guard");
+    if sockets_write_guard.contains(&socket_path) {
+        init_callback(Ok(socket_path.clone()));
+        return;
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let socket_path_cloned = socket_path.clone();
+    let glide_rt = match get_or_init_runtime() {
+        Ok(handle) => handle,
+        Err(err) => {
+            init_callback(Err(err));
+            return;
+        }
+    };
+
+    glide_rt.runtime.spawn(async move {
+        let listener_socket = match UnixListener::bind(socket_path_cloned.clone()) {
+            Err(err) => {
+                log_error(
+                    "listen_on_socket",
+                    format!("Failed to bind listening socket: {err}"),
+                );
+
+                if let Err(err) = tx.send(Err(err)) {
+                    log_error(
+                        "listen_on_socket",
+                        format!(
+                            "Failed to notify about socket binding failure.
+                      Channel send error: {err:?}"
+                        ),
+                    );
                 }
-                Err(err) => init_callback(Err(err.to_string())),
-            };
-        })
-        .expect("Thread spawn failed. Cannot report error because callback was moved.");
+                return;
+            }
+            Ok(listener_socket) => listener_socket,
+        };
+
+        // Restrict permissions: rw------- (owner only)
+        if let Err(err) =
+            fs::set_permissions(&socket_path_cloned, fs::Permissions::from_mode(0o600))
+        {
+            log_error(
+                "listen_on_socket",
+                format!("Failed to set socket path permissions: {err:?}"),
+            );
+            let _ = tx.send(Err(err));
+            return;
+        }
+
+        // Signal initialization is successful.
+        let _ = tx.send(Ok(socket_path_cloned.clone()));
+
+        let local_set_pool = LocalPoolHandle::new(num_cpus::get());
+        loop {
+            match listener_socket.accept().await {
+                Ok((stream, _addr)) => {
+                    local_set_pool.spawn_pinned(move || listen_on_client_stream(stream));
+                }
+                Err(err) => {
+                    log_error(
+                        "listen_on_socket",
+                        format!("Error accepting connection: {err}"),
+                    );
+                    break;
+                }
+            }
+        }
+
+        // ensure socket file removal
+        drop(listener_socket);
+        let _ = std::fs::remove_file(socket_path_cloned.clone());
+
+        // no more listening on socket - update the sockets db
+        let mut sockets_write_guard = INITIALIZED_SOCKETS
+            .write()
+            .expect("Failed to acquire sockets db write guard");
+        sockets_write_guard.remove(&socket_path_cloned);
+    });
+
+    match rx.recv()
+        .map_err(|e| e.to_string()) // recv error -> String
+        .and_then(|res| res.map_err(|e| e.to_string())) // inner thread error -> String
+        {
+            Ok(socket_path) => {
+                sockets_write_guard.insert(socket_path.clone());
+                init_callback(Ok(socket_path));
+            }
+            Err(err) => {
+                init_callback(Err(err));
+            }
+        }
 }
 
 /// Creates a new thread with a main loop task listening on the socket for new connections.
@@ -863,7 +1052,7 @@ pub fn start_socket_listener_internal<InitCallback>(
 /// * `init_callback` - called when the socket listener fails to initialize, with the reason for the failure.
 pub fn start_socket_listener<InitCallback>(init_callback: InitCallback)
 where
-    InitCallback: FnOnce(Result<String, String>) + Send + 'static,
+    InitCallback: FnOnce(Result<String, String>) + Send + Clone + 'static,
 {
     start_socket_listener_internal(init_callback, None);
 }

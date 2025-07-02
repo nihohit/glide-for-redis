@@ -1,9 +1,11 @@
+// Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
+
 use glide_core::{
     client::Client,
     connection_request::{ConnectionRequest, NodeAddress, TlsMode},
 };
 use iai_callgrind::{black_box, library_benchmark, library_benchmark_group, main};
-use redis::{cmd, Value};
+use redis::{Value, cmd};
 use tokio::runtime::Builder;
 
 fn create_connection_request() -> ConnectionRequest {
@@ -23,7 +25,9 @@ where
 {
     let runtime = Builder::new_current_thread().enable_all().build().unwrap();
     runtime.block_on(async {
-        let client = Client::new(create_connection_request()).await.unwrap();
+        let client = Client::new(create_connection_request().into(), None)
+            .await
+            .unwrap();
         f(client).await;
     });
 }

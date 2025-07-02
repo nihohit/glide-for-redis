@@ -1,32 +1,42 @@
+// Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
+
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 use clap::Parser;
-use futures::{self, future::join_all, stream, StreamExt};
-use glide_core::{
-    client::Client,
-    connection_request::{ConnectionRequest, NodeAddress, TlsMode},
-};
-use rand::{thread_rng, Rng};
+use futures::{self, StreamExt, future::join_all, stream};
+use glide_core::client::{Client, ConnectionRequest, NodeAddress, TlsMode};
+use rand::{Rng, thread_rng};
 use serde_json::Value;
 use std::{
     cmp::max,
     collections::HashMap,
     path::Path,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{Arc, atomic::AtomicUsize},
     time::{Duration, Instant},
 };
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(name = "resultsFile", long)]
+    #[arg(
+        name = "resultsFile",
+        long,
+        default_value = "../results/rust-results.json"
+    )]
     results_file: String,
 
-    #[arg(long)]
+    #[arg(long, default_value = "localhost")]
     host: String,
 
-    #[arg(name = "dataSize", long)]
+    #[arg(name = "dataSize", long, default_value_t = 100)]
     data_size: usize,
 
-    #[arg(name = "concurrentTasks", long)]
+    #[arg(name = "concurrentTasks", long, default_values_t = [1,10,100,1000])]
     concurrent_tasks: Vec<usize>,
 
     #[arg(name = "clientCount", long, default_value_t = 1)]
@@ -171,31 +181,30 @@ async fn perform_benchmark(args: Args) {
 }
 
 fn calculate_latencies(values: &[Duration], prefix: &str) -> HashMap<String, Value> {
-    let values: Vec<f64> = values
+    let mut latencies: Vec<f64> = values
         .iter()
-        .map(|duration| duration.as_secs_f64() * 1000.0) // seconds -> ms
+        .map(|duration| duration.as_secs_f64() * 1000.0) // Convert to milliseconds
         .collect();
+
+    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
     let mut map = HashMap::new();
-    map.insert(
-        format!("{prefix}_p50_latency"),
-        values[values.len() / 2].into(),
-    );
-    map.insert(
-        format!("{prefix}_p90_latency"),
-        values[values.len() / 100 * 90].into(),
-    );
-    map.insert(
-        format!("{prefix}_p99_latency"),
-        values[values.len() / 100 * 99].into(),
-    );
-    map.insert(
-        format!("{prefix}_average_latency"),
-        statistical::mean(values.as_slice()).into(),
-    );
-    map.insert(
-        format!("{prefix}_std_dev"),
-        statistical::standard_deviation(values.as_slice(), None).into(),
-    );
+    let len = latencies.len() as f64;
+    if len == 0.0 {
+        panic!("No latencies were found");
+    }
+
+    let p50 = latencies[(len * 0.5) as usize];
+    let p90 = latencies[(len * 0.9) as usize];
+    let p99 = latencies[(len * 0.99) as usize];
+    let avg = statistical::mean(&latencies);
+    let stddev = statistical::standard_deviation(&latencies, None);
+
+    map.insert(format!("{prefix}_p50_latency"), p50.into());
+    map.insert(format!("{prefix}_p90_latency"), p90.into());
+    map.insert(format!("{prefix}_p99_latency"), p99.into());
+    map.insert(format!("{prefix}_average_latency"), avg.into());
+    map.insert(format!("{prefix}_std_dev"), stddev.into());
     map
 }
 
@@ -208,27 +217,29 @@ fn generate_random_string(length: usize) -> String {
 }
 
 async fn get_connection(args: &Args) -> Client {
-    let mut connection_request = ConnectionRequest::new();
-    connection_request.tls_mode = if args.tls {
-        TlsMode::SecureTls
-    } else {
-        TlsMode::NoTls
-    }
-    .into();
-    let mut address_info: NodeAddress = NodeAddress::new();
-    address_info.host = args.host.clone().into();
-    address_info.port = args.port;
-    connection_request.addresses.push(address_info);
-    connection_request.request_timeout = 2000;
-    connection_request.cluster_mode_enabled = args.cluster_mode_enabled;
+    let address_info: NodeAddress = NodeAddress {
+        host: args.host.clone(),
+        port: args.port as u16,
+    };
+    let connection_request = ConnectionRequest {
+        addresses: vec![address_info],
+        cluster_mode_enabled: args.cluster_mode_enabled,
+        request_timeout: Some(2000),
+        tls_mode: if args.tls {
+            Some(TlsMode::SecureTls)
+        } else {
+            Some(TlsMode::NoTls)
+        },
+        ..Default::default()
+    };
 
-    glide_core::client::Client::new(connection_request)
+    glide_core::client::Client::new(connection_request, None)
         .await
         .unwrap()
 }
 
 async fn single_benchmark_task(
-    connections: &Vec<Client>,
+    connections: &[Client],
     counter: Arc<AtomicUsize>,
     number_of_operations: usize,
     number_of_concurrent_tasks: usize,

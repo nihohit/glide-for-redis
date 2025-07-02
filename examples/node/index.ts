@@ -1,16 +1,22 @@
-import { Logger, RedisClient, RedisClusterClient } from "glide-for-redis";
+/**
+ * Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
+ */
 
-async function sendPingToNode() {
-    // When in Redis is in standalone mode, add address of the primary node, and any replicas you'd like to be able to read from.
+import { GlideClient, GlideClusterClient, Logger } from "@valkey/valkey-glide";
+
+async function sendPingToStandAloneNode() {
+    // When Valkey is in standalone mode, add address of the primary node, and any replicas you'd like to be able to read from.
     const addresses = [
         {
             host: "localhost",
             port: 6379,
         },
     ];
-    // Check `RedisClientConfiguration/ClusterClientConfiguration` for additional options.
-    const client = await RedisClient.createClient({
+    // Check `GlideClientConfiguration/GlideClusterClientConfiguration` for additional options.
+    const client = await GlideClient.createClient({
         addresses: addresses,
+        // Set request timeout - recommended to configure based on your use case.
+        requestTimeout: 500,
         // if the server uses TLS, you'll need to enable it. Otherwise the connection attempt will time out silently.
         // useTLS: true,
         clientName: "test_standalone_client",
@@ -22,7 +28,7 @@ async function sendPingToNode() {
     client.close();
 }
 
-async function send_set_and_get(client: RedisClient | RedisClusterClient) {
+async function send_set_and_get(client: GlideClient | GlideClusterClient) {
     const set_response = await client.set("foo", "bar");
     console.log(`Set response is = ${set_response}`);
     const get_response = await client.get("foo");
@@ -30,22 +36,24 @@ async function send_set_and_get(client: RedisClient | RedisClusterClient) {
 }
 
 async function sendPingToRandomNodeInCluster() {
-    // When in Redis is cluster mode, add address of any nodes, and the client will find all nodes in the cluster.
+    // When Valkey is in cluster mode, add address of any nodes, and the client will find all nodes in the cluster.
     const addresses = [
         {
             host: "localhost",
             port: 6380,
         },
     ];
-    // Check `RedisClientConfiguration/ClusterClientConfiguration` for additional options.
-    const client = await RedisClusterClient.createClient({
+    // Check `GlideClientConfiguration/GlideClusterClientConfiguration` for additional options.
+    const client = await GlideClusterClient.createClient({
         addresses: addresses,
+        // Set request timeout - recommended to configure based on your use case.
+        requestTimeout: 500,
         // if the cluster nodes use TLS, you'll need to enable it. Otherwise the connection attempt will time out silently.
         // useTLS: true,
         clientName: "test_cluster_client",
     });
     // The empty array signifies that there are no additional arguments.
-    const pong = await client.customCommand(["PING"], "randomNode");
+    const pong = await client.customCommand(["PING"], { route: "randomNode" });
     console.log(pong);
     await send_set_and_get(client);
     client.close();
@@ -60,6 +68,9 @@ function setConsoleLogger() {
 }
 
 setFileLogger();
-await sendPingToNode();
 setConsoleLogger();
-await sendPingToRandomNodeInCluster();
+// Enable for standalone mode
+await sendPingToStandAloneNode();
+
+// Enable for cluster mode
+// await sendPingToRandomNodeInCluster();

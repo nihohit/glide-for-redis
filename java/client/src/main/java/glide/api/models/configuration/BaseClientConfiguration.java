@@ -1,3 +1,4 @@
+/** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.api.models.configuration;
 
 import java.util.List;
@@ -8,8 +9,8 @@ import lombok.Singular;
 import lombok.experimental.SuperBuilder;
 
 /**
- * Configuration settings class for creating a Redis Client. Shared settings for standalone and
- * cluster clients.
+ * Configuration settings class for creating a client. Shared settings for standalone and cluster
+ * clients.
  */
 @Getter
 @SuperBuilder
@@ -41,13 +42,46 @@ public abstract class BaseClientConfiguration {
      * Credentials for authentication process. If none are set, the client will not authenticate
      * itself with the server.
      */
-    private final RedisCredentials credentials;
+    private final ServerCredentials credentials;
 
     /**
      * The duration in milliseconds that the client should wait for a request to complete. This
      * duration encompasses sending the request, awaiting for a response from the server, and any
-     * required reconnections or retries. If the specified timeout is exceeded for a pending request,
-     * it will result in a timeout error. If not set, a default value will be used.
+     * required reconnection or retries. If the specified timeout is exceeded for a pending request,
+     * it will result in a timeout error. If not explicitly set, a default value of 250 milliseconds
+     * will be used.
      */
     private final Integer requestTimeout;
+
+    /**
+     * Client name to be used for the client. Will be used with CLIENT SETNAME command during
+     * connection establishment.
+     */
+    private final String clientName;
+
+    /**
+     * Serialization protocol to be used with the server. If not set, {@link ProtocolVersion#RESP3}
+     * will be used.
+     */
+    private final ProtocolVersion protocol;
+
+    public abstract BaseSubscriptionConfiguration getSubscriptionConfiguration();
+
+    /**
+     * The maximum number of concurrent requests allowed to be in-flight (sent but not yet completed).
+     * This limit is used to control the memory usage and prevent the client from overwhelming the
+     * server or getting stuck in case of a queue backlog. If not set, a default value of 1000 will be
+     * used.
+     */
+    private final Integer inflightRequestsLimit;
+
+    /**
+     * Availability Zone of the client. If ReadFrom strategy is AZAffinity or
+     * AZAffinityReplicasAndPrimary, this setting ensures that readonly commands are directed to nodes
+     * within the specified AZ if exits.
+     */
+    private final String clientAZ;
+
+    /** Strategy used to determine how and when to reconnect, in case of connection failures. */
+    private final BackoffStrategy reconnectStrategy;
 }

@@ -25,6 +25,7 @@ runPython=0
 runNode=0
 runCsharp=0
 runJava=0
+runGo=0
 runRust=0
 concurrentTasks="1 10 100 1000"
 dataSize="100 4000"
@@ -33,7 +34,7 @@ chosenClients="all"
 host="localhost"
 port=6379
 tlsFlag="--tls"
-javaTlsFlag="-tls"
+dotnetFramework="net6.0"
 
 function runPythonBenchmark(){
   # generate protobuf files
@@ -67,13 +68,19 @@ function runNodeBenchmark(){
 function runCSharpBenchmark(){
   cd ${BENCH_FOLDER}/csharp
   dotnet clean
-  dotnet build --configuration Release
-  dotnet run --configuration Release --resultsFile=../$1 --dataSize $2 --concurrentTasks $concurrentTasks --clients $chosenClients --host $host --clientCount $clientCount $tlsFlag $portFlag $minimalFlag
+  dotnet build --configuration Release /warnaserror
+  dotnet run --framework $dotnetFramework --configuration Release --resultsFile=../$1 --dataSize $2 --concurrentTasks $concurrentTasks --clients $chosenClients --host $host --clientCount $clientCount $tlsFlag $portFlag $minimalFlag
 }
 
 function runJavaBenchmark(){
   cd ${BENCH_FOLDER}/../java
-  ./gradlew run --args="-resultsFile \"${BENCH_FOLDER}/$1\" -dataSize \"$2\" -concurrentTasks \"$concurrentTasks\" -clients \"$chosenClients\" -host $host $javaPortFlag -clientCount \"$clientCount\" $javaTlsFlag $javaClusterFlag"
+  ./gradlew :benchmarks:run --args="-resultsFile \"${BENCH_FOLDER}/$1\" --dataSize \"$2\" --concurrentTasks \"$concurrentTasks\" --clients \"$chosenClients\" --host $host $portFlag --clientCount \"$clientCount\" $tlsFlag $clusterFlag $minimalFlag"
+}
+
+function runGoBenchmark(){
+    cd ${BENCH_FOLDER}/../go/benchmarks
+    export LD_LIBRARY_PATH=${BENCH_FOLDER}/../go/target/release:$LD_LIBRARY_PATH
+    go run . -resultsFile "${BENCH_FOLDER}/$1" -dataSize "$2" -concurrentTasks "$concurrentTasks" -clients "$chosenClients" -host "$host" $portFlag -clientCount "$clientCount" $tlsFlag $clusterFlag $minimalFlag
 }
 
 function runRustBenchmark(){
@@ -115,7 +122,7 @@ function resultFileName() {
 
 function Help() {
     echo Running the script without any arguments runs all benchmarks.
-    echo Pass -node, -csharp, -python, -java as arguments in order to run the node, csharp, python, or java benchmarks accordingly.
+    echo Pass -node, -csharp, -python, -java, -go as arguments in order to run the node, csharp, python, java, or go benchmarks accordingly.
     echo Multiple such flags can be passed.
     echo Pass -no-csv to skip analysis of the results.
     echo
@@ -135,13 +142,12 @@ function Help() {
     echo "         2 clients, 100 concurrent tasks and 20 bytes of data per value, "
     echo and the outputs will be saved to a file prefixed with \"foo\".
     echo
-    echo Pass -only-ffi to only run GLIDE FFI based clients.
-    echo Pass -only-socket to only run GLIDE socket based clients.
     echo Pass -only-glide to only run GLIDE clients.
     echo Pass -is-cluster if the host is a Cluster server. Otherwise the server is assumed to be in standalone mode.
     echo The benchmark will connect to the server using transport level security \(TLS\) by default. Pass -no-tls to connect to server without TLS.
     echo By default, the benchmark runs against localhost. Pass -host and then the address of the requested Redis server in order to connect to a different server.
     echo By default, the benchmark runs against port 6379. Pass -port and then the port number in order to connect to a different port.
+    echo By default, the C# benchmark runs with 'net6.0' framework. Pass -dotnet-framework and then the framework version in order to use a different framework.
 }
 
 while test $# -gt 0
@@ -198,12 +204,21 @@ do
         -lettuce)
             runAllBenchmarks=0
             runJava=1
-            chosenClients="lettuce_async"
+            chosenClients="lettuce"
             ;;
         -jedis)
             runAllBenchmarks=0
             runJava=1
             chosenClients="Jedis"
+            ;;
+        -go)
+            runAllBenchmarks=0
+            runGo=1
+            ;;
+        -go-redis)
+            runAllBenchmarks=0
+            runGo=1
+            chosenClients="go-redis"
             ;;
         -csharp)
             runAllBenchmarks=0
@@ -219,20 +234,20 @@ do
         -no-csv) writeResultsCSV=0 ;;
         -no-tls)
             tlsFlag=
-            javaTlsFlag=
             ;;
         -is-cluster)
             clusterFlag="--clusterModeEnabled"
-            javaClusterFlag="-clusterModeEnabled"
             ;;
         -port)
             portFlag="--port "$2
-            javaPortFlag="-port "$2
             shift
             ;;
         -minimal)
             minimalFlag="--minimal"
-            ;;            
+            ;;
+        -dotnet-framework)
+            dotnetFramework=$2
+            ;;
     esac
     shift
 done
@@ -243,7 +258,7 @@ do
     then
         echo "Minimal run, not filling database"
         flushDB
-    else 
+    else
         fillDB $currentDataSize
     fi
 
@@ -273,6 +288,13 @@ do
         javaResults=$(resultFileName java $currentDataSize)
         resultFiles+=$javaResults" "
         runJavaBenchmark $javaResults $currentDataSize
+    fi
+
+    if [ $runAllBenchmarks == 1 ] || [ $runGo == 1 ];
+    then
+        goResults=$(resultFileName go $currentDataSize)
+        resultFiles+=$goResults" "
+        runGoBenchmark $goResults $currentDataSize
     fi
 
     if [ $runAllBenchmarks == 1 ] || [ $runRust == 1 ];

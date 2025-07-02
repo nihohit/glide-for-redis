@@ -1,5 +1,7 @@
 #!/bin/python3
 
+# Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
+
 import csv
 import json
 import os
@@ -41,7 +43,7 @@ with open(output_file_name, "w+") as output_file:
 
             json_file_name = os.path.basename(json_file_full_path)
 
-            languages = ["csharp", "node", "python", "rust", "java"]
+            languages = ["csharp", "node", "python", "rust", "java", "go"]
             language = next(
                 (language for language in languages if language in json_file_name), None
             )

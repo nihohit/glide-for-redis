@@ -1,155 +1,125 @@
+# Welcome to Valkey GLIDE!
+
+Valkey General Language Independent Driver for the Enterprise (GLIDE) is the official open-source Valkey client library, proudly part of the Valkey organization. Our mission is to make your experience with Valkey and Redis OSS seamless and enjoyable. Whether you're a seasoned developer or just starting out, Valkey GLIDE is here to support you every step of the way.
+
+# Why Choose Valkey GLIDE?
+
+- **Community and Open Source**: Join our vibrant community and contribute to the project. We are always here to respond, and the client is for the community.
+- **Reliability**: Built with best practices learned from over a decade of operating Redis OSS-compatible services.
+- **Performance**: Optimized for high performance and low latency.
+- **High Availability**: Designed to ensure your applications are always up and running.
+- **Cross-Language Support**: Implemented using a core driver framework written in Rust, with language-specific extensions to ensure consistency and reduce complexity.
+- **Stability and Fault Tolerance**: We brought our years of experience to create a bulletproof client.
+- **Backed and Supported by AWS and GCP**: Ensuring robust support and continuous improvement of the project.
+
+## Documentation
+
+See GLIDE's [documentation site](https://valkey.io/valkey-glide/).  
+Visit our [wiki](https://github.com/valkey-io/valkey-glide/wiki/Python-wrapper) for examples and further details on TLS, Read strategy, Timeouts and various other configurations.
+
+## Supported Engine Versions
+
+Refer to the [Supported Engine Versions table](https://github.com/valkey-io/valkey-glide/blob/main/README.md#supported-engine-versions) for details.
+
 # Getting Started - Python Wrapper
 
 ## System Requirements
 
-The beta release of GLIDE for Redis was tested on Intel x86_64 using Ubuntu 22.04.1, Amazon Linux 2023 (AL2023), and macOS 12.7.
+The release of Valkey GLIDE was tested on the following platforms:
 
-## Python supported version
-Python 3.8 or higher.
+Linux:
+
+-   Ubuntu 20 (x86_64/amd64 and arm64/aarch64)
+-   Amazon Linux 2 (AL2) and 2023 (AL2023) (x86_64)
+
+**Note: Currently Alpine Linux / MUSL is NOT supported.**
+
+macOS:
+
+-   macOS 14.7 (Apple silicon/aarch_64)
+-   macOS 13.7 (x86_64/amd64)
+
+## Python Supported Versions
+
+| Python Version |
+|----------------|
+| 3.9            |
+| 3.10           |
+| 3.11           |
+| 3.12           |
+| 3.13           |
+
+Valkey GLIDE transparently supports both the `asyncio` and `trio` concurrency frameworks.
 
 ## Installation and Setup
 
 ### Installing via Package Manager (pip)
 
-To install GLIDE for Redis using `pip`, follow these steps:
+To install Valkey GLIDE using `pip`, follow these steps:
 
 1. Open your terminal.
 2. Execute the command below:
-   ```bash
-   $ pip install glide-for-redis
-   ```
+    ```bash
+    $ pip install valkey-glide
+    ```
 3. After installation, confirm the client is accessible by running:
     ```bash
     $ python3
     >>> import glide
     ```
 
-### Build from source
-
-#### Prerequisites
-
-Software Dependencies
-
--   python3 virtualenv
--   git
--   GCC
--   pkg-config
--   protoc (protobuf compiler)
--   openssl
--   openssl-dev
--   rustup
-
-**Dependencies installation for Ubuntu**
-```bash
-sudo apt update -y
-sudo apt install -y python3 python3-venv git gcc pkg-config protobuf-compiler openssl libssl-dev
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-```
-
-**Dependencies installation for CentOS**
-```bash 
-sudo yum update -y
-sudo yum install -y python3 git gcc pkgconfig protobuf-compiler openssl openssl-devel
-pip3 install virtualenv
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-```
-
-**Dependencies installation for MacOS**
-```bash
-brew update
-brew install python3 git gcc pkgconfig protobuf openssl 
-pip3 install virtualenv
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-```
-
-#### Building and installation steps
-Before starting this step, make sure you've installed all software requirments. 
-1. Clone the repository:
-    ```bash
-    VERSION=0.1.0 # You can modify this to other released version or set it to "main" to get the unstable branch
-    git clone --branch ${VERSION} https://github.com/aws/glide-for-redis.git
-    cd glide-for-redis
-    ```
-2. Initialize git submodule:
-    ```bash
-    git submodule update --init --recursive
-    ```
-3. Generate protobuf files:
-    ```bash
-    GLIDE_ROOT_FOLDER_PATH=.
-    protoc -Iprotobuf=${GLIDE_ROOT_FOLDER_PATH}/glide-core/src/protobuf/ --python_out=${GLIDE_ROOT_FOLDER_PATH}/python/python/glide ${GLIDE_ROOT_FOLDER_PATH}/glide-core/src/protobuf/*.proto
-    ```
-4. Create a virtual environment:
-    ```bash
-    cd python
-    python3 -m venv .env
-    ```
-5. Activate the virtual environment:
-    ```bash
-    source .env/bin/activate
-    ```
-6. Install requirements:
-    ```bash
-    pip install -r requirements.txt
-    ```
-7. Build the Python wrapper in release mode:
-    ```
-    maturin develop --release --strip
-    ```
-     > **Note:** To build the wrapper binary with debug symbols remove the --strip flag.
-8. Run tests:
-    1. Ensure that you have installed redis-server and redis-cli on your host. You can find the Redis installation guide at the following link: [Redis Installation Guide](https://redis.io/docs/install/install-redis/install-redis-on-linux/).
-    2. Validate the activation of the virtual environment from step 4 by ensuring its name (`.env`) is displayed next to your command prompt. 
-    3. Execute the following command from the python folder:
-        ```bash
-        pytest --asyncio-mode=auto
-        ```
-        > **Note:** To run redis modules tests, add -k "test_redis_modules.py".
-
 ## Basic Examples
 
-#### Cluster Redis:
+#### Cluster Mode:
 
 ```python:
->>> from glide import (
-...     NodeAddress,
-...     ClusterClientConfiguration,
-...     RedisClusterClient,
-... )
->>> addresses = [NodeAddress("redis.example.com", 6379)]
->>> config = ClusterClientConfiguration(
-...     addresses=addresses
-... )
->>> client = await RedisClusterClient.create(config)
->>> await client.set("foo", "bar")
-'OK'
->>> await client.get("foo")
-'bar'
+>>> import asyncio
+>>> from glide import GlideClusterClientConfiguration, NodeAddress, GlideClusterClient
+>>> async def test_cluster_client():
+...     addresses = [NodeAddress("address.example.com", 6379)]
+...     # It is recommended to set a timeout for your specific use case
+...     config = GlideClusterClientConfiguration(addresses, request_timeout=500)  # 500ms timeout
+...     client = await GlideClusterClient.create(config)
+...     set_result = await client.set("foo", "bar")
+...     print(f"Set response is {set_result}")
+...     get_result = await client.get("foo")
+...     print(f"Get response is {get_result}")
+... 
+>>> asyncio.run(test_cluster_client())
+Set response is OK
+Get response is bar
 ```
 
-#### Standalone Redis:
+#### Standalone Mode:
 
 ```python:
->>> from glide import (
-...     NodeAddress,
-...     RedisClientConfiguration,
-...     RedisClient,
-... )
->>> addresses = [NodeAddress("redis_primary.example.com", 6379), NodeAddress("redis_replica.example.com", 6379)]
->>> config = RedisClientConfiguration(
-...     addresses=addresses
-... )
->>> client = await RedisClient.create(config)
->>> await client.set("foo", "bar")
-'OK'
->>> await client.get("foo")
-'bar'
+>>> import asyncio
+>>> from glide import GlideClientConfiguration, NodeAddress, GlideClient
+>>> async def test_standalone_client():
+...     addresses = [
+...             NodeAddress("server_primary.example.com", 6379),
+...             NodeAddress("server_replica.example.com", 6379)
+...     ]
+...     # It is recommended to set a timeout for your specific use case
+...     config = GlideClientConfiguration(addresses, request_timeout=500)  # 500ms timeout
+...     client = await GlideClient.create(config)
+...     set_result = await client.set("foo", "bar")
+...     print(f"Set response is {set_result}")
+...     get_result = await client.get("foo")
+...     print(f"Get response is {get_result}")
+... 
+>>> asyncio.run(test_standalone_client())
+Set response is OK
+Get response is bar
 ```
 
-## Documenation
+For complete examples with error handling, please refer to the [cluster example](https://github.com/valkey-io/valkey-glide/blob/main/examples/python/cluster_example.py) and the [standalone example](https://github.com/valkey-io/valkey-glide/blob/main/examples/python/standalone_example.py).
 
-Visit our [wiki](https://github.com/aws/glide-for-redis/wiki/Python-wrapper) for examples and further details on TLS, Read strategy, Timeouts and various other configurations.
 
+### Building & Testing
+
+Development instructions for local building & testing the package are in the [DEVELOPER.md](https://github.com/valkey-io/valkey-glide/blob/main/python/DEVELOPER.md#build-from-source) file.
+
+## Community and Feedback
+
+We encourage you to join our community to support, share feedback, and ask questions. You can approach us for anything on our Valkey Slack: [Join Valkey Slack](https://join.slack.com/t/valkey-oss-developer/shared_invite/zt-2nxs51chx-EB9hu9Qdch3GMfRcztTSkQ).
